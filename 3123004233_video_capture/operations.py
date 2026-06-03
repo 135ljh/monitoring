@@ -20,6 +20,8 @@ RAW_VIDEO_TOPIC = "workshop.raw_video"
 DEFAULT_CAMERA_ID = "CAM_001"
 DEFAULT_SEGMENT_SECONDS = 10
 DEFAULT_RECONNECT_SECONDS = 5
+DEFAULT_MAX_RECONNECT_ATTEMPTS = 5
+DEFAULT_CAPTURE_SECONDS = 0
 
 _TASKS = {}
 _TASKS_LOCK = threading.Lock()
@@ -47,6 +49,10 @@ def start_capture(data):
     camera_id = (data or {}).get("camera_id") or DEFAULT_CAMERA_ID
     segment_seconds = int((data or {}).get("segment_seconds") or _config_value(
         "VIDEO_CAPTURE", "SEGMENT_SECONDS", default=DEFAULT_SEGMENT_SECONDS))
+    max_reconnect_attempts = int((data or {}).get("max_reconnect_attempts") or _config_value(
+        "VIDEO_CAPTURE", "MAX_RECONNECT_ATTEMPTS", default=DEFAULT_MAX_RECONNECT_ATTEMPTS))
+    capture_seconds = int((data or {}).get("capture_seconds") or _config_value(
+        "VIDEO_CAPTURE", "CAPTURE_SECONDS", default=DEFAULT_CAPTURE_SECONDS))
     raw_video_topic = _config_value("KAFKA", "RAW_VIDEO_TOPIC", default=RAW_VIDEO_TOPIC)
 
     with _TASKS_LOCK:
@@ -69,6 +75,9 @@ def start_capture(data):
             "url": source_url,
             "raw_video_topic": raw_video_topic,
             "segment_seconds": segment_seconds,
+            "max_reconnect_attempts": max_reconnect_attempts,
+            "capture_seconds": capture_seconds,
+            "deadline": time.time() + capture_seconds if capture_seconds > 0 else None,
             "status": "starting",
             "started_at": _now_text(),
             "last_error": None,
@@ -98,50 +107,32 @@ def start_capture(data):
     }
 
 
-def stop_capture(data):
-    """
-    stop_capture接口:
-    停止指定 monitor_id 的后台采集任务；不传 monitor_id 时停止当前组件内全部采集任务。
-    """
-    monitor_id = (data or {}).get("monitor_id")
-    stopped = []
-
-    with _TASKS_LOCK:
-        targets = [monitor_id] if monitor_id else list(_TASKS.keys())
-        for item in targets:
-            task = _TASKS.get(item)
-            if not task:
-                continue
-            task["stop_event"].set()
-            task["status"] = "stopping"
-            stopped.append(item)
-
-    for item in stopped:
-        _set_redis_status(item, "stopping")
-
-    return {
-        "msg": "success",
-        "data": {
-            "monitor_id": monitor_id,
-            "stopped_monitor_ids": stopped,
-            "status": "stopping" if stopped else "not_found"
-        }
-    }
-
-
 def _capture_loop(task):
     producer = None
     sequence = 1
+    reconnect_attempts = 0
     try:
         producer = _create_kafka_producer()
         _update_task(task["monitor_id"], status="running")
 
         while not task["stop_event"].is_set():
+            if _task_deadline_reached(task):
+                print("video capture task reached configured capture_seconds, stopping: %s" % task["monitor_id"])
+                task["stop_event"].set()
+                break
+
             capture = _open_capture(task["url"])
             if not capture.isOpened():
+                reconnect_attempts += 1
                 message = "cannot open video stream, retrying: %s" % task["url"]
                 print(message)
                 _update_task(task["monitor_id"], status="reconnecting", last_error=message)
+                if task["max_reconnect_attempts"] > 0 and reconnect_attempts >= task["max_reconnect_attempts"]:
+                    message = "video stream unavailable after %s attempts: %s" % (reconnect_attempts, task["url"])
+                    print(message)
+                    _update_task(task["monitor_id"], status="error", last_error=message)
+                    _set_redis_status(task["monitor_id"], "error")
+                    break
                 if task["stop_event"].wait(int(_config_value(
                     "VIDEO_CAPTURE",
                     "RECONNECT_SECONDS",
@@ -151,8 +142,12 @@ def _capture_loop(task):
                 continue
 
             try:
+                reconnect_attempts = 0
                 _update_task(task["monitor_id"], status="running", last_error=None)
                 while not task["stop_event"].is_set():
+                    if _task_deadline_reached(task):
+                        task["stop_event"].set()
+                        break
                     clip = _record_clip(
                         capture=capture,
                         monitor_id=task["monitor_id"],
@@ -184,6 +179,11 @@ def _capture_loop(task):
         final_status = "stopped" if task["stop_event"].is_set() else task.get("status", "stopped")
         _update_task(task["monitor_id"], status=final_status)
         _set_redis_status(task["monitor_id"], final_status)
+
+
+def _task_deadline_reached(task):
+    deadline = task.get("deadline")
+    return deadline is not None and time.time() >= deadline
 
 
 def _open_capture(source_url):

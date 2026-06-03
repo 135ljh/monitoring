@@ -17,9 +17,6 @@ class Route(object):
 list = [
     Route(desc="""""",
           operation="start_capture",
-          ),
-    Route(desc="""""",
-          operation="stop_capture",
           )
 
 ]
