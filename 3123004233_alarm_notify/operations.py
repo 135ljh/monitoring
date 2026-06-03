@@ -157,12 +157,44 @@ def _call_enterprise_notify(event):
     url = _config_value("ALARM", "WEBHOOK_URL", os.getenv("ALARM_WEBHOOK_URL"))
     if not url:
         return "not_configured"
-    payload = {"text": _message(event), "event": event}
+
+    method = _config_value("ALARM", "NOTIFY_METHOD", "wechat")
+    payload = _notify_payload(method, event)
     try:
         resp = requests.post(url, json=payload, timeout=8)
-        return "success" if resp.status_code < 400 else "failed:%s" % resp.status_code
+        if resp.status_code >= 400:
+            return "failed:%s:%s" % (resp.status_code, resp.text[:200])
+        try:
+            body = resp.json()
+        except ValueError:
+            body = {}
+        if body and body.get("errcode") not in (None, 0):
+            return "failed:wechat:%s:%s" % (body.get("errcode"), body.get("errmsg"))
+        return "success:%s" % method
     except Exception as exc:
         return "failed:%s" % exc
+
+
+def _notify_payload(method, event):
+    content = _message(event)
+    if method in ("wechat", "wecom", "enterprise_wechat"):
+        return {
+            "msgtype": "text",
+            "text": {
+                "content": content,
+            },
+        }
+    if method == "dingtalk":
+        return {
+            "msgtype": "text",
+            "text": {
+                "content": content,
+            },
+        }
+    return {
+        "text": content,
+        "event": event,
+    }
 
 
 def _write_plc_register(address, value):
