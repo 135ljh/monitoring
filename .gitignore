@@ -11,3 +11,5 @@ __pycache__/
 *.log
 tmp/
 temp/
+nacos-data/
+**/nacos-data/

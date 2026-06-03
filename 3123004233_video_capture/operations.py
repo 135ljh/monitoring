@@ -98,6 +98,37 @@ def start_capture(data):
     }
 
 
+def stop_capture(data):
+    """
+    stop_capture接口:
+    停止指定 monitor_id 的后台采集任务；不传 monitor_id 时停止当前组件内全部采集任务。
+    """
+    monitor_id = (data or {}).get("monitor_id")
+    stopped = []
+
+    with _TASKS_LOCK:
+        targets = [monitor_id] if monitor_id else list(_TASKS.keys())
+        for item in targets:
+            task = _TASKS.get(item)
+            if not task:
+                continue
+            task["stop_event"].set()
+            task["status"] = "stopping"
+            stopped.append(item)
+
+    for item in stopped:
+        _set_redis_status(item, "stopping")
+
+    return {
+        "msg": "success",
+        "data": {
+            "monitor_id": monitor_id,
+            "stopped_monitor_ids": stopped,
+            "status": "stopping" if stopped else "not_found"
+        }
+    }
+
+
 def _capture_loop(task):
     producer = None
     sequence = 1
@@ -111,11 +142,12 @@ def _capture_loop(task):
                 message = "cannot open video stream, retrying: %s" % task["url"]
                 print(message)
                 _update_task(task["monitor_id"], status="reconnecting", last_error=message)
-                time.sleep(int(_config_value(
+                if task["stop_event"].wait(int(_config_value(
                     "VIDEO_CAPTURE",
                     "RECONNECT_SECONDS",
                     default=DEFAULT_RECONNECT_SECONDS,
-                )))
+                ))):
+                    break
                 continue
 
             try:
@@ -139,7 +171,8 @@ def _capture_loop(task):
             finally:
                 capture.release()
 
-            time.sleep(2)
+            if task["stop_event"].wait(2):
+                break
     except Exception:
         error = traceback.format_exc()
         print("video capture task failed:\n%s" % error)
@@ -148,6 +181,9 @@ def _capture_loop(task):
     finally:
         if producer is not None:
             producer.close()
+        final_status = "stopped" if task["stop_event"].is_set() else task.get("status", "stopped")
+        _update_task(task["monitor_id"], status=final_status)
+        _set_redis_status(task["monitor_id"], final_status)
 
 
 def _open_capture(source_url):
