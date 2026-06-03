@@ -161,7 +161,12 @@ def _call_enterprise_notify(event):
     method = _config_value("ALARM", "NOTIFY_METHOD", "wechat")
     payload = _notify_payload(method, event)
     try:
-        resp = requests.post(url, json=payload, timeout=8)
+        resp = requests.post(
+            url,
+            data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+            headers={"Content-Type": "application/json; charset=utf-8"},
+            timeout=8,
+        )
         if resp.status_code >= 400:
             return "failed:%s:%s" % (resp.status_code, resp.text[:200])
         try:
