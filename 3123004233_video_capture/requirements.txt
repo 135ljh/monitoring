@@ -1,0 +1,8 @@
+nacos_sdk_python==0.1.12
+paho_mqtt==1.6.1
+PyYAML==6.0.1
+numpy==1.24.4
+redis==5.0.1
+kafka-python==2.0.2
+minio==7.2.7
+opencv-python-headless==4.9.0.80
