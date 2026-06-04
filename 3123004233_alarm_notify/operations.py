@@ -174,7 +174,7 @@ def _call_enterprise_notify(event):
     try:
         resp = requests.post(
             url,
-            data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+            data=json.dumps(payload, ensure_ascii=True).encode("utf-8"),
             headers={"Content-Type": "application/json; charset=utf-8"},
             timeout=8,
         )
@@ -308,7 +308,32 @@ def _alarm_result(event, triggered, methods, message, notify_status, sound_statu
 
 
 def _message(event):
-    return "车间检测到异常行为：%s。请及时处理。" % event.get("event_description", "未知异常")
+    return "车间检测到异常行为：%s。请及时处理。" % _event_description(event)
+
+
+def _event_description(event):
+    description = str(event.get("event_description") or "").strip()
+    if description and not _looks_garbled(description):
+        return description
+
+    names = []
+    for item in event.get("abnormal_types", []) or []:
+        names.append({
+            "person_static": "人员长时间静止",
+            "person_fall": "人员疑似跌倒",
+            "person_intrusion": "人员进入危险区域",
+            "device_vibration": "设备异常震动",
+            "device_stop": "设备异常停机",
+            "unknown_abnormal": "未知异常",
+        }.get(item, item))
+    return "，".join(names) if names else "未知异常"
+
+
+def _looks_garbled(text):
+    if not text:
+        return True
+    question_count = text.count("?") + text.count("？")
+    return question_count >= 3 or question_count >= max(1, len(text) // 3)
 
 
 def _create_consumer(topic, group_id):
