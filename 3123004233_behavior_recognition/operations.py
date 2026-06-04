@@ -6,7 +6,7 @@ import tempfile
 import threading
 import uuid
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 
 import cv2
 import numpy as np
@@ -260,14 +260,30 @@ def _iou(a, b):
 def _download_url(url, target):
     parsed = urlparse(url)
     if parsed.scheme in ("http", "https"):
-        with requests.get(url, stream=True, timeout=30) as resp:
-            resp.raise_for_status()
-            with open(target, "wb") as fh:
-                for chunk in resp.iter_content(chunk_size=1024 * 1024):
-                    if chunk:
-                        fh.write(chunk)
-        return
+        try:
+            with requests.get(url, stream=True, timeout=30) as resp:
+                resp.raise_for_status()
+                with open(target, "wb") as fh:
+                    for chunk in resp.iter_content(chunk_size=1024 * 1024):
+                        if chunk:
+                            fh.write(chunk)
+            return
+        except requests.HTTPError as exc:
+            if exc.response is None or exc.response.status_code != 403:
+                raise
+            _download_from_minio_url(url, target)
+            return
     raise ValueError("unsupported video url: %s" % url)
+
+
+def _download_from_minio_url(url, target):
+    parsed = urlparse(url)
+    parts = [unquote(item) for item in parsed.path.strip("/").split("/") if item]
+    if len(parts) < 2:
+        raise ValueError("invalid MinIO object url: %s" % url)
+    bucket = parts[0]
+    object_name = "/".join(parts[1:])
+    _minio_client().fget_object(bucket, object_name, str(target))
 
 
 def _create_consumer(topic, group_id):
