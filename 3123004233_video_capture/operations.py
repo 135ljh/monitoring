@@ -44,6 +44,7 @@ def start_capture(data):
         raise ValueError("url is required")
 
     _validate_video_url(source_url)
+    video_source = _parse_video_source(source_url)
 
     monitor_id = (data or {}).get("monitor_id") or _new_monitor_id()
     camera_id = (data or {}).get("camera_id") or DEFAULT_CAMERA_ID
@@ -73,6 +74,7 @@ def start_capture(data):
             "monitor_id": monitor_id,
             "camera_id": camera_id,
             "url": source_url,
+            "video_source": video_source,
             "raw_video_topic": raw_video_topic,
             "segment_seconds": segment_seconds,
             "max_reconnect_attempts": max_reconnect_attempts,
@@ -121,7 +123,7 @@ def _capture_loop(task):
                 task["stop_event"].set()
                 break
 
-            capture = _open_capture(task["url"])
+            capture = _open_capture(task["video_source"])
             if not capture.isOpened():
                 reconnect_attempts += 1
                 message = "cannot open video stream, retrying: %s" % task["url"]
@@ -186,7 +188,13 @@ def _task_deadline_reached(task):
     return deadline is not None and time.time() >= deadline
 
 
-def _open_capture(source_url):
+def _open_capture(video_source):
+    if isinstance(video_source, int):
+        capture = cv2.VideoCapture(video_source, cv2.CAP_DSHOW)
+        if not capture.isOpened():
+            capture = cv2.VideoCapture(video_source)
+        return capture
+
     os.environ.setdefault(
         "OPENCV_FFMPEG_CAPTURE_OPTIONS",
         "rtsp_transport;tcp|stimeout;5000000",
@@ -198,11 +206,11 @@ def _open_capture(source_url):
         5000,
     ]
     try:
-        capture = cv2.VideoCapture(source_url, cv2.CAP_FFMPEG, params)
+        capture = cv2.VideoCapture(video_source, cv2.CAP_FFMPEG, params)
     except Exception:
-        capture = cv2.VideoCapture(source_url, cv2.CAP_FFMPEG)
+        capture = cv2.VideoCapture(video_source, cv2.CAP_FFMPEG)
     if not capture.isOpened():
-        capture = cv2.VideoCapture(source_url)
+        capture = cv2.VideoCapture(video_source)
     return capture
 
 
@@ -381,9 +389,39 @@ def _update_task(monitor_id, **kwargs):
 
 
 def _validate_video_url(source_url):
+    if _is_local_camera_source(source_url):
+        return
     parsed = urlparse(source_url)
-    if parsed.scheme.lower() not in ("rtsp", "http", "https", "file"):
+    if parsed.scheme.lower() not in ("rtsp", "http", "https", "file", "camera", "webcam"):
         raise ValueError("unsupported video url scheme: %s" % parsed.scheme)
+
+
+def _parse_video_source(source_url):
+    text = str(source_url).strip()
+    if _is_local_camera_source(text):
+        return _parse_camera_index(text)
+    return text
+
+
+def _is_local_camera_source(source_url):
+    text = str(source_url).strip().lower()
+    return (
+        text.isdigit()
+        or text.startswith("camera://")
+        or text.startswith("webcam://")
+        or text.startswith("local_camera://")
+    )
+
+
+def _parse_camera_index(source_url):
+    text = str(source_url).strip().lower()
+    for prefix in ("camera://", "webcam://", "local_camera://"):
+        if text.startswith(prefix):
+            text = text[len(prefix):]
+            break
+    if not text.isdigit():
+        raise ValueError("invalid local camera index: %s" % source_url)
+    return int(text)
 
 
 def _new_monitor_id():
