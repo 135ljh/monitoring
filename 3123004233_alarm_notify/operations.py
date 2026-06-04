@@ -1,15 +1,21 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
+import base64
 import datetime as dt
+import hashlib
 import json
 import os
 import socket
+import tempfile
 import threading
 import time
+from pathlib import Path
+from urllib.parse import parse_qs, unquote, urlparse
 
 import pyttsx3
 import requests
 from kafka import KafkaConsumer, KafkaProducer
+from minio import Minio
 from pymodbus.client import ModbusTcpClient
 from pymodbus.exceptions import ModbusException
 
@@ -31,7 +37,10 @@ DEFAULT_TTS_PORT = 50000
 DEFAULT_TTS_TIMEOUT = 3.0
 DEFAULT_TTS_RATE = 150
 DEFAULT_TTS_VOLUME = 0.9
+
 DEFAULT_COOLDOWN_SECONDS = 60
+DEFAULT_IMAGE_MAX_BYTES = 2 * 1024 * 1024
+DEFAULT_VIDEO_MAX_BYTES = 20 * 1024 * 1024
 
 _TASKS = {}
 _LOCK = threading.Lock()
@@ -114,7 +123,7 @@ def _handle_event(event):
 
     notify_status = _call_enterprise_notify(event)
     if notify_status != "not_configured":
-        methods.append(_config_value("ALARM", "NOTIFY_METHOD", "webhook"))
+        methods.append(_config_value("ALARM", "NOTIFY_METHOD", "wechat"))
 
     if not methods:
         methods = ["record_only"]
@@ -128,10 +137,7 @@ def _handle_event(event):
 def _should_set_cooldown(methods, notify_status, sound_status, voice_status):
     if methods == ["record_only"]:
         return False
-    return any(
-        str(status).startswith("success")
-        for status in (notify_status, sound_status, voice_status)
-    )
+    return any(str(status).startswith("success") for status in (notify_status, sound_status, voice_status))
 
 
 def _call_sound_light(event):
@@ -170,7 +176,24 @@ def _call_enterprise_notify(event):
         return "not_configured"
 
     method = _config_value("ALARM", "NOTIFY_METHOD", "wechat")
-    payload = _notify_payload(method, event)
+    if method not in ("wechat", "wecom", "enterprise_wechat"):
+        return _send_webhook_payload(url, _notify_payload(method, event), method)
+
+    statuses = []
+    statuses.append("text=%s" % _send_webhook_payload(url, _notify_payload(method, event), method))
+
+    if _config_bool("ALARM", "SEND_EVIDENCE_IMAGE", True):
+        statuses.append("image=%s" % _send_wechat_image(url, event.get("evidence_frame_url")))
+
+    if _config_bool("ALARM", "SEND_EVIDENCE_VIDEO", True):
+        statuses.append("video=%s" % _send_wechat_file(url, event.get("evidence_video_url"), event))
+
+    if any(item.endswith("success:wechat") or "=success:wechat" in item for item in statuses):
+        return "success:wechat:%s" % ";".join(statuses)
+    return "failed:wechat:%s" % ";".join(statuses)
+
+
+def _send_webhook_payload(url, payload, method):
     try:
         resp = requests.post(
             url,
@@ -180,12 +203,9 @@ def _call_enterprise_notify(event):
         )
         if resp.status_code >= 400:
             return "failed:%s:%s" % (resp.status_code, resp.text[:200])
-        try:
-            body = resp.json()
-        except ValueError:
-            body = {}
+        body = _json_or_empty(resp)
         if body and body.get("errcode") not in (None, 0):
-            return "failed:wechat:%s:%s" % (body.get("errcode"), body.get("errmsg"))
+            return "failed:%s:%s" % (body.get("errcode"), body.get("errmsg"))
         return "success:%s" % method
     except Exception as exc:
         return "failed:%s" % exc
@@ -193,24 +213,132 @@ def _call_enterprise_notify(event):
 
 def _notify_payload(method, event):
     content = _message(event)
-    if method in ("wechat", "wecom", "enterprise_wechat"):
-        return {
-            "msgtype": "text",
-            "text": {
-                "content": content,
+    if method in ("wechat", "wecom", "enterprise_wechat", "dingtalk"):
+        return {"msgtype": "text", "text": {"content": content}}
+    return {"text": content, "event": event}
+
+
+def _send_wechat_image(url, image_url):
+    if not image_url:
+        return "skipped:no_image_url"
+    try:
+        image_bytes = _download_bytes(image_url)
+        max_bytes = int(_config_value("ALARM", "IMAGE_MAX_BYTES", DEFAULT_IMAGE_MAX_BYTES))
+        if len(image_bytes) > max_bytes:
+            return "skipped:image_too_large:%s" % len(image_bytes)
+        payload = {
+            "msgtype": "image",
+            "image": {
+                "base64": base64.b64encode(image_bytes).decode("ascii"),
+                "md5": hashlib.md5(image_bytes).hexdigest(),
             },
         }
-    if method == "dingtalk":
-        return {
-            "msgtype": "text",
-            "text": {
-                "content": content,
-            },
-        }
-    return {
-        "text": content,
-        "event": event,
-    }
+        return _send_webhook_payload(url, payload, "wechat")
+    except Exception as exc:
+        return "failed:%s" % exc
+
+
+def _send_wechat_file(url, file_url, event):
+    if not file_url:
+        return "skipped:no_video_url"
+
+    key = _wechat_webhook_key(url)
+    if not key:
+        return "skipped:no_webhook_key"
+
+    suffix = Path(urlparse(file_url).path).suffix or ".mp4"
+    filename = "%s_%s%s" % (event.get("event_id", "event"), event.get("clip_id", "clip"), suffix)
+    target = Path(tempfile.gettempdir()) / filename
+    try:
+        _download_file(file_url, target)
+        max_bytes = int(_config_value("ALARM", "VIDEO_MAX_BYTES", DEFAULT_VIDEO_MAX_BYTES))
+        size = target.stat().st_size
+        if size > max_bytes:
+            return "skipped:video_too_large:%s" % size
+        media_id = _upload_wechat_media(key, target)
+        payload = {"msgtype": "file", "file": {"media_id": media_id}}
+        return _send_webhook_payload(url, payload, "wechat")
+    except Exception as exc:
+        return "failed:%s" % exc
+    finally:
+        _safe_unlink(target)
+
+
+def _upload_wechat_media(key, file_path):
+    upload_url = "https://qyapi.weixin.qq.com/cgi-bin/webhook/upload_media"
+    with open(file_path, "rb") as fh:
+        resp = requests.post(
+            upload_url,
+            params={"key": key, "type": "file"},
+            files={"media": (file_path.name, fh, "application/octet-stream")},
+            timeout=30,
+        )
+    if resp.status_code >= 400:
+        raise RuntimeError("upload_media failed: %s %s" % (resp.status_code, resp.text[:200]))
+    body = _json_or_empty(resp)
+    if body.get("errcode") not in (None, 0):
+        raise RuntimeError("upload_media failed: %s %s" % (body.get("errcode"), body.get("errmsg")))
+    media_id = body.get("media_id")
+    if not media_id:
+        raise RuntimeError("upload_media missing media_id")
+    return media_id
+
+
+def _wechat_webhook_key(url):
+    return (parse_qs(urlparse(url).query).get("key") or [""])[0]
+
+
+def _download_bytes(url):
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        raise ValueError("unsupported evidence url: %s" % url)
+    try:
+        resp = requests.get(url, timeout=30)
+        resp.raise_for_status()
+        return resp.content
+    except requests.HTTPError as exc:
+        if exc.response is None or exc.response.status_code != 403:
+            raise
+        bucket, object_name = _minio_object_from_url(url)
+        response = _minio_client().get_object(bucket, object_name)
+        try:
+            return response.read()
+        finally:
+            response.close()
+            response.release_conn()
+
+
+def _download_file(url, target):
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        raise ValueError("unsupported evidence url: %s" % url)
+    try:
+        with requests.get(url, stream=True, timeout=30) as resp:
+            resp.raise_for_status()
+            with open(target, "wb") as fh:
+                for chunk in resp.iter_content(chunk_size=1024 * 1024):
+                    if chunk:
+                        fh.write(chunk)
+    except requests.HTTPError as exc:
+        if exc.response is None or exc.response.status_code != 403:
+            raise
+        bucket, object_name = _minio_object_from_url(url)
+        _minio_client().fget_object(bucket, object_name, str(target))
+
+
+def _minio_object_from_url(url):
+    parts = [unquote(item) for item in urlparse(url).path.strip("/").split("/") if item]
+    if len(parts) < 2:
+        raise ValueError("invalid MinIO url: %s" % url)
+    return parts[0], "/".join(parts[1:])
+
+
+def _minio_client():
+    endpoint = _config_value("MINIO", "ENDPOINT", os.getenv("MINIO_ENDPOINT", "10.21.221.12:9000"))
+    access_key = _config_value("MINIO", "ACCESS_KEY", os.getenv("MINIO_ACCESS_KEY", "minioadmin"))
+    secret_key = _config_value("MINIO", "SECRET_KEY", os.getenv("MINIO_SECRET_KEY", "Admin@hd2019"))
+    secure = str(_config_value("MINIO", "SECURE", os.getenv("MINIO_SECURE", "false"))).lower() == "true"
+    return Minio(endpoint, access_key=access_key, secret_key=secret_key, secure=secure)
 
 
 def _write_plc_register(address, value):
@@ -308,7 +436,21 @@ def _alarm_result(event, triggered, methods, message, notify_status, sound_statu
 
 
 def _message(event):
-    return "车间检测到异常行为：%s。请及时处理。" % _event_description(event)
+    lines = [
+        _u("车间检测到异常行为：%s。请及时处理。") % _event_description(event),
+        _u("事件时间：%s") % (event.get("event_time") or _now_text()),
+        _u("异常等级：%s") % event.get("abnormal_level", "unknown"),
+        _u("异常类型：%s") % ", ".join(event.get("abnormal_types", []) or ["unknown"]),
+    ]
+    if event.get("camera_id"):
+        lines.append(_u("摄像头：%s") % event.get("camera_id"))
+    if event.get("clip_id"):
+        lines.append(_u("视频片段：%s") % event.get("clip_id"))
+    if event.get("evidence_frame_url"):
+        lines.append(_u("证据图片：%s") % event.get("evidence_frame_url"))
+    if event.get("evidence_video_url"):
+        lines.append(_u("证据视频：%s") % event.get("evidence_video_url"))
+    return "\n".join(lines)
 
 
 def _event_description(event):
@@ -318,21 +460,25 @@ def _event_description(event):
 
     names = []
     for item in event.get("abnormal_types", []) or []:
-        names.append({
-            "person_static": "人员长时间静止",
-            "person_fall": "人员疑似跌倒",
-            "person_intrusion": "人员进入危险区域",
-            "device_vibration": "设备异常震动",
-            "device_stop": "设备异常停机",
-            "unknown_abnormal": "未知异常",
-        }.get(item, item))
-    return "，".join(names) if names else "未知异常"
+        names.append(_type_name(item))
+    return _u("，").join(names) if names else _u("未知异常")
+
+
+def _type_name(item):
+    return {
+        "person_static": _u("人员长时间静止"),
+        "person_fall": _u("人员疑似跌倒"),
+        "person_intrusion": _u("人员进入危险区域"),
+        "device_vibration": _u("设备异常震动"),
+        "device_stop": _u("设备异常停机"),
+        "unknown_abnormal": _u("未知异常"),
+    }.get(item, item)
 
 
 def _looks_garbled(text):
     if not text:
         return True
-    question_count = text.count("?") + text.count("？")
+    question_count = text.count("?") + text.count(_u("？"))
     return question_count >= 3 or question_count >= max(1, len(text) // 3)
 
 
@@ -415,6 +561,24 @@ def _config_bool(section, key, default):
     if isinstance(value, bool):
         return value
     return str(value).strip().lower() not in ("0", "false", "no", "off")
+
+
+def _json_or_empty(resp):
+    try:
+        return resp.json()
+    except ValueError:
+        return {}
+
+
+def _safe_unlink(path):
+    try:
+        Path(path).unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
+def _u(text):
+    return text
 
 
 def _update_task(monitor_id, **kwargs):

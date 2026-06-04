@@ -7,3 +7,4 @@ kafka-python==2.0.2
 requests==2.32.3
 pymodbus==3.11.4
 pyttsx3==2.99
+minio==7.2.7
