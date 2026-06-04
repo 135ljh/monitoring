@@ -124,7 +124,7 @@ def _handle_event(event):
 
 
 def _call_sound_light(event):
-    if not _config_bool("ALARM", "ENABLE_PLC_ALARM", True):
+    if not _config_bool("ALARM", "ENABLE_PLC_ALARM", False):
         return "not_configured:plc_disabled"
 
     alarm_enable_address = _config_value("ALARM", "PLC_ALARM_ENABLE_ADDRESS", DEFAULT_ALARM_ENABLE_ADDRESS)
@@ -142,7 +142,7 @@ def _call_sound_light(event):
 
 
 def _call_voice_alarm(event):
-    if not _config_bool("ALARM", "ENABLE_VOICE_ALARM", True):
+    if not _config_bool("ALARM", "ENABLE_VOICE_ALARM", False):
         return "not_configured:voice_disabled"
 
     text = _message(event)
