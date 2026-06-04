@@ -31,6 +31,7 @@ DEFAULT_TTS_PORT = 50000
 DEFAULT_TTS_TIMEOUT = 3.0
 DEFAULT_TTS_RATE = 150
 DEFAULT_TTS_VOLUME = 0.9
+DEFAULT_COOLDOWN_SECONDS = 60
 
 _TASKS = {}
 _LOCK = threading.Lock()
@@ -118,9 +119,19 @@ def _handle_event(event):
     if not methods:
         methods = ["record_only"]
 
-    cooldown_seconds = int(_config_value("ALARM", "COOLDOWN_SECONDS", 300))
-    _set_key(cooldown_key, "1", cooldown_seconds)
+    if _should_set_cooldown(methods, notify_status, sound_status, voice_status):
+        cooldown_seconds = int(_config_value("ALARM", "COOLDOWN_SECONDS", DEFAULT_COOLDOWN_SECONDS))
+        _set_key(cooldown_key, "1", cooldown_seconds)
     return _alarm_result(event, True, methods, _message(event), notify_status, sound_status, voice_status)
+
+
+def _should_set_cooldown(methods, notify_status, sound_status, voice_status):
+    if methods == ["record_only"]:
+        return False
+    return any(
+        str(status).startswith("success")
+        for status in (notify_status, sound_status, voice_status)
+    )
 
 
 def _call_sound_light(event):
