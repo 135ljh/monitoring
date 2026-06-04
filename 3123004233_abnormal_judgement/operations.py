@@ -13,6 +13,7 @@ from kafka import KafkaConsumer, KafkaProducer
 RECOGNITION_RESULT_TOPIC = "workshop.recognition_result"
 ABNORMAL_EVENT_TOPIC = "workshop.abnormal_event"
 DEFAULT_GROUP = "workshop-abnormal-judgement"
+DEFAULT_STATIC_SECONDS = 10.0
 
 _TASKS = {}
 _LOCK = threading.Lock()
@@ -91,7 +92,7 @@ def _judge_message(msg):
 
         person_id = person.get("person_id", "unknown")
         duration = _accumulate_static_duration(monitor_id, person_id, msg)
-        if duration >= float(_config_value("JUDGE", "STATIC_SECONDS", 30.0)):
+        if duration >= float(_config_value("JUDGE", "STATIC_SECONDS", DEFAULT_STATIC_SECONDS)):
             abnormal_types.append("person_static")
             descriptions.append("人员%s静止超过%.1f秒" % (person_id, duration))
 
