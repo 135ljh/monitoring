@@ -116,6 +116,7 @@ def _recognize_message(msg):
         "end_time": msg.get("end_time"),
         "person_results": analysis["person_results"],
         "device_results": analysis["device_results"],
+        "scene_result": analysis.get("scene_result", {}),
         "annotated_video_url": annotated_video_url,
         "annotated_frame_url": annotated_frame_url,
     }
@@ -144,7 +145,9 @@ def _analyze_video(source_path, annotated_path, annotated_frame_path):
     prev_gray = None
     motion_scores = []
     vibration_scores = []
+    upper_motion_scores = []
     person_boxes = []
+    sampled_person_boxes = []
     frame_index = 0
 
     device_roi = _device_roi(width, height)
@@ -155,13 +158,18 @@ def _analyze_video(source_path, annotated_path, annotated_frame_path):
             if prev_gray is not None:
                 diff = cv2.absdiff(prev_gray, gray)
                 motion_scores.append(float(np.mean(diff)) / 255.0)
+                upper_motion_scores.append(float(np.mean(diff[:max(1, height // 2), :])) / 255.0)
                 vibration_scores.append(_optical_flow_score(prev_gray, gray, device_roi))
 
             if frame_index % max(1, int(fps)) == 0:
                 boxes, weights = hog.detectMultiScale(frame, winStride=(8, 8), padding=(8, 8), scale=1.05)
+                accepted = []
                 for box, weight in zip(boxes, weights):
                     if float(weight) >= 0.2:
-                        person_boxes.append([int(v) for v in box])
+                        accepted.append([int(v) for v in box])
+                if accepted:
+                    person_boxes.extend(accepted)
+                    sampled_person_boxes.append(_dedupe_boxes(accepted))
 
             annotated = frame.copy()
             for box in person_boxes[-3:]:
@@ -182,17 +190,30 @@ def _analyze_video(source_path, annotated_path, annotated_frame_path):
 
     movement_score = round(float(np.mean(motion_scores)) if motion_scores else 0.0, 4)
     vibration_score = round(float(np.mean(vibration_scores)) if vibration_scores else 0.0, 4)
+    upper_motion_score = round(float(np.mean(upper_motion_scores)) if upper_motion_scores else 0.0, 4)
     action_type = "static" if movement_score < float(_config_value("RECOGNITION", "STATIC_MOTION_THRESHOLD", 0.018)) else "moving"
     vibration_level = _vibration_level(vibration_score)
 
     person_results = []
-    for idx, box in enumerate(_dedupe_boxes(person_boxes)[:5] or [[0, 0, width, height]]):
+    deduped_boxes = _dedupe_boxes(person_boxes)
+    center_speed = _person_center_speed(sampled_person_boxes, width, height)
+    for idx, box in enumerate(deduped_boxes[:10] or [[0, 0, width, height]]):
         x, y, w, h = box
+        posture_type, posture_score = _posture_from_box(box, width, height)
+        fall_suspected = _fall_suspected(box, width, height, posture_type, bool(deduped_boxes))
+        running_suspected = center_speed >= float(_config_value("RECOGNITION", "RUNNING_SPEED_THRESHOLD", 0.22))
+        help_suspected = _help_gesture_suspected(upper_motion_score, movement_score, posture_type)
         person_results.append({
             "person_id": "P%03d" % (idx + 1),
             "bbox": [x, y, x + w, y + h],
             "action_type": action_type,
             "movement_score": movement_score,
+            "center_speed": round(center_speed, 4),
+            "posture_type": posture_type,
+            "posture_score": round(posture_score, 4),
+            "fall_suspected": fall_suspected,
+            "running_suspected": running_suspected,
+            "help_gesture_suspected": help_suspected,
             "confidence": 0.65 if person_boxes else 0.35,
         })
 
@@ -204,7 +225,62 @@ def _analyze_video(source_path, annotated_path, annotated_frame_path):
         "optical_flow_value": round(vibration_score * 100.0, 4),
     }]
 
-    return {"person_results": person_results, "device_results": device_results}
+    scene_result = {
+        "person_count": len(deduped_boxes),
+        "crowd_count": len(deduped_boxes),
+        "movement_score": movement_score,
+        "upper_motion_score": upper_motion_score,
+    }
+
+    return {"person_results": person_results, "device_results": device_results, "scene_result": scene_result}
+
+
+def _person_center_speed(sampled_boxes, width, height):
+    centers = []
+    for boxes in sampled_boxes:
+        if not boxes:
+            continue
+        x, y, w, h = max(boxes, key=lambda item: item[2] * item[3])
+        centers.append(((x + w / 2.0) / max(1, width), (y + h / 2.0) / max(1, height)))
+    if len(centers) < 2:
+        return 0.0
+    distances = []
+    for idx in range(1, len(centers)):
+        dx = centers[idx][0] - centers[idx - 1][0]
+        dy = centers[idx][1] - centers[idx - 1][1]
+        distances.append(float(np.sqrt(dx * dx + dy * dy)))
+    return float(np.mean(distances)) if distances else 0.0
+
+
+def _posture_from_box(box, width, height):
+    _, y, w, h = box
+    aspect = float(w) / max(1.0, float(h))
+    height_ratio = float(h) / max(1.0, float(height))
+    center_y = (float(y) + h / 2.0) / max(1.0, float(height))
+
+    if aspect >= float(_config_value("RECOGNITION", "FALL_ASPECT_THRESHOLD", 1.15)):
+        return "horizontal", aspect
+    if height_ratio <= float(_config_value("RECOGNITION", "SQUAT_HEIGHT_RATIO", 0.42)) and center_y > 0.45:
+        return "squat", height_ratio
+    if aspect >= float(_config_value("RECOGNITION", "BEND_ASPECT_THRESHOLD", 0.72)):
+        return "bend", aspect
+    return "standing", height_ratio
+
+
+def _fall_suspected(box, width, height, posture_type, detected):
+    if not detected:
+        return False
+    _, y, w, h = box
+    aspect = float(w) / max(1.0, float(h))
+    bottom_ratio = float(y + h) / max(1.0, float(height))
+    return posture_type == "horizontal" and aspect >= 1.15 and bottom_ratio >= 0.55
+
+
+def _help_gesture_suspected(upper_motion_score, movement_score, posture_type):
+    if posture_type not in ("standing", "bend"):
+        return False
+    threshold = float(_config_value("RECOGNITION", "HELP_GESTURE_UPPER_MOTION_THRESHOLD", 0.08))
+    return upper_motion_score >= threshold and upper_motion_score >= movement_score * 1.4
 
 
 def _optical_flow_score(prev_gray, gray, roi):

@@ -13,7 +13,17 @@ from kafka import KafkaConsumer, KafkaProducer
 RECOGNITION_RESULT_TOPIC = "workshop.recognition_result"
 ABNORMAL_EVENT_TOPIC = "workshop.abnormal_event"
 DEFAULT_GROUP = "workshop-abnormal-judgement"
+
 DEFAULT_STATIC_SECONDS = 10.0
+DEFAULT_FALL_SECONDS = 3.0
+DEFAULT_ABNORMAL_POSTURE_SECONDS = 20.0
+DEFAULT_PERSON_ABSENT_SECONDS = 60.0
+DEFAULT_CROWD_SECONDS = 10.0
+DEFAULT_RUNNING_SECONDS = 2.0
+DEFAULT_HELP_GESTURE_SECONDS = 2.0
+DEFAULT_FALL_NO_MOVEMENT_SECONDS = 10.0
+DEFAULT_CROWD_PERSON_THRESHOLD = 5
+DEFAULT_VIBRATION_DANGER_THRESHOLD = 0.006
 
 _TASKS = {}
 _LOCK = threading.Lock()
@@ -84,37 +94,32 @@ def _judge_message(msg):
     monitor_id = msg["monitor_id"]
     abnormal_types = []
     descriptions = []
+    scene = msg.get("scene_result", {}) or {}
 
     for person in msg.get("person_results", []):
-        if person.get("action_type") != "static":
-            _delete_key("monitor:%s:person:%s:static_start_time" % (monitor_id, person.get("person_id")))
-            continue
-
         person_id = person.get("person_id", "unknown")
-        duration = _accumulate_static_duration(monitor_id, person_id, msg)
-        if duration >= float(_config_value("JUDGE", "STATIC_SECONDS", DEFAULT_STATIC_SECONDS)):
-            abnormal_types.append("person_static")
-            descriptions.append("人员%s静止超过%.1f秒" % (person_id, duration))
+        _judge_person_static(monitor_id, msg, person, person_id, abnormal_types, descriptions)
+        _judge_person_fall(monitor_id, msg, person, person_id, abnormal_types, descriptions)
+        _judge_abnormal_posture(monitor_id, msg, person, person_id, abnormal_types, descriptions)
+        _judge_person_running(monitor_id, msg, person, person_id, abnormal_types, descriptions)
+        _judge_help_gesture(monitor_id, msg, person, person_id, abnormal_types, descriptions)
+        _judge_fall_no_movement(monitor_id, msg, person, person_id, abnormal_types, descriptions)
 
-    for device in msg.get("device_results", []):
-        key = "monitor:%s:device:%s:vibration_history" % (monitor_id, device.get("device_id", "unknown"))
-        _push_history(key, device.get("vibration_score", 0.0))
-        if device.get("vibration_level") == "danger":
-            abnormal_types.append("device_vibration")
-            descriptions.append("设备%s存在异常震动" % device.get("device_id", "unknown"))
+    _judge_person_absent(monitor_id, msg, scene, abnormal_types, descriptions)
+    _judge_crowd_gathering(monitor_id, msg, scene, abnormal_types, descriptions)
+    _judge_device_vibration(monitor_id, msg, abnormal_types, descriptions)
 
     abnormal_types = sorted(set(abnormal_types))
     if not abnormal_types:
         return None
 
-    level = _event_level(abnormal_types)
     return {
         "monitor_id": monitor_id,
         "event_id": "evt_%s" % uuid.uuid4().hex[:12],
         "is_abnormal": True,
         "abnormal_types": abnormal_types,
-        "abnormal_level": level,
-        "event_description": "，".join(descriptions) if descriptions else "检测到异常行为",
+        "abnormal_level": _event_level(abnormal_types),
+        "event_description": "\uff0c".join(descriptions) if descriptions else "\u68c0\u6d4b\u5230\u5f02\u5e38\u884c\u4e3a",
         "evidence_video_url": msg.get("annotated_video_url"),
         "evidence_frame_url": msg.get("annotated_frame_url"),
         "event_time": _now_text(),
@@ -123,15 +128,126 @@ def _judge_message(msg):
     }
 
 
+def _judge_person_static(monitor_id, msg, person, person_id, abnormal_types, descriptions):
+    condition = "person:%s:static" % person_id
+    if person.get("action_type") != "static":
+        _delete_condition(monitor_id, condition)
+        return
+    duration = _accumulate_condition_duration(monitor_id, condition, msg)
+    if duration >= float(_config_value("JUDGE", "STATIC_SECONDS", DEFAULT_STATIC_SECONDS)):
+        abnormal_types.append("person_static")
+        descriptions.append("\u4eba\u5458%s\u9759\u6b62\u8d85\u8fc7%.1f\u79d2" % (person_id, duration))
+
+
+def _judge_person_fall(monitor_id, msg, person, person_id, abnormal_types, descriptions):
+    condition = "person:%s:fall" % person_id
+    if not person.get("fall_suspected"):
+        _delete_condition(monitor_id, condition)
+        return
+    duration = _accumulate_condition_duration(monitor_id, condition, msg)
+    if duration >= float(_config_value("JUDGE", "FALL_SECONDS", DEFAULT_FALL_SECONDS)):
+        abnormal_types.append("person_fall")
+        descriptions.append("\u4eba\u5458%s\u7591\u4f3c\u8dcc\u5012\u6301\u7eed%.1f\u79d2" % (person_id, duration))
+
+
+def _judge_abnormal_posture(monitor_id, msg, person, person_id, abnormal_types, descriptions):
+    condition = "person:%s:abnormal_posture" % person_id
+    posture_type = person.get("posture_type")
+    if posture_type not in ("bend", "squat"):
+        _delete_condition(monitor_id, condition)
+        return
+    duration = _accumulate_condition_duration(monitor_id, condition, msg)
+    if duration >= float(_config_value("JUDGE", "ABNORMAL_POSTURE_SECONDS", DEFAULT_ABNORMAL_POSTURE_SECONDS)):
+        abnormal_types.append("abnormal_posture")
+        descriptions.append("\u4eba\u5458%s\u957f\u65f6\u95f4%s\u59ff\u6001\u8d85\u8fc7%.1f\u79d2" % (
+            person_id, _posture_name(posture_type), duration))
+
+
+def _judge_person_running(monitor_id, msg, person, person_id, abnormal_types, descriptions):
+    condition = "person:%s:running" % person_id
+    if not person.get("running_suspected"):
+        _delete_condition(monitor_id, condition)
+        return
+    duration = _accumulate_condition_duration(monitor_id, condition, msg)
+    if duration >= float(_config_value("JUDGE", "RUNNING_SECONDS", DEFAULT_RUNNING_SECONDS)):
+        abnormal_types.append("person_running")
+        descriptions.append("\u4eba\u5458%s\u5feb\u901f\u79fb\u52a8\u6301\u7eed%.1f\u79d2" % (person_id, duration))
+
+
+def _judge_help_gesture(monitor_id, msg, person, person_id, abnormal_types, descriptions):
+    condition = "person:%s:help_gesture" % person_id
+    if not person.get("help_gesture_suspected"):
+        _delete_condition(monitor_id, condition)
+        return
+    duration = _accumulate_condition_duration(monitor_id, condition, msg)
+    if duration >= float(_config_value("JUDGE", "HELP_GESTURE_SECONDS", DEFAULT_HELP_GESTURE_SECONDS)):
+        abnormal_types.append("help_gesture")
+        descriptions.append("\u4eba\u5458%s\u7591\u4f3c\u6325\u624b\u6c42\u52a9" % person_id)
+
+
+def _judge_fall_no_movement(monitor_id, msg, person, person_id, abnormal_types, descriptions):
+    condition = "person:%s:fall_no_movement" % person_id
+    motion_threshold = float(_config_value("JUDGE", "FALL_NO_MOVEMENT_MOTION_THRESHOLD", 0.012))
+    if not person.get("fall_suspected") or float(person.get("movement_score", 0.0) or 0.0) >= motion_threshold:
+        _delete_condition(monitor_id, condition)
+        return
+    duration = _accumulate_condition_duration(monitor_id, condition, msg)
+    if duration >= float(_config_value("JUDGE", "FALL_NO_MOVEMENT_SECONDS", DEFAULT_FALL_NO_MOVEMENT_SECONDS)):
+        abnormal_types.append("fall_no_movement")
+        descriptions.append("\u4eba\u5458%s\u5012\u5730\u540e%.1f\u79d2\u5185\u51e0\u4e4e\u65e0\u52a8\u4f5c" % (person_id, duration))
+
+
+def _judge_person_absent(monitor_id, msg, scene, abnormal_types, descriptions):
+    condition = "scene:person_absent"
+    person_count = int(scene.get("person_count", 0) or 0)
+    if person_count != 0:
+        _delete_condition(monitor_id, condition)
+        return
+    duration = _accumulate_condition_duration(monitor_id, condition, msg)
+    if duration >= float(_config_value("JUDGE", "PERSON_ABSENT_SECONDS", DEFAULT_PERSON_ABSENT_SECONDS)):
+        abnormal_types.append("person_absent")
+        descriptions.append("\u6307\u5b9a\u5de5\u4f4d\u533a\u57df\u8fde\u7eed%.1f\u79d2\u672a\u68c0\u6d4b\u5230\u4eba\u5458" % duration)
+
+
+def _judge_crowd_gathering(monitor_id, msg, scene, abnormal_types, descriptions):
+    condition = "scene:crowd_gathering"
+    person_count = int(scene.get("crowd_count", scene.get("person_count", 0)) or 0)
+    threshold = int(_config_value("JUDGE", "CROWD_PERSON_THRESHOLD", DEFAULT_CROWD_PERSON_THRESHOLD))
+    if person_count <= threshold:
+        _delete_condition(monitor_id, condition)
+        return
+    duration = _accumulate_condition_duration(monitor_id, condition, msg)
+    if duration >= float(_config_value("JUDGE", "CROWD_SECONDS", DEFAULT_CROWD_SECONDS)):
+        abnormal_types.append("crowd_gathering")
+        descriptions.append("\u540c\u4e00\u533a\u57df\u4eba\u6570%d\u4eba\u8d85\u8fc7\u9608\u503c%d\u4eba\u5e76\u6301\u7eed%.1f\u79d2" % (
+            person_count, threshold, duration))
+
+
+def _judge_device_vibration(monitor_id, msg, abnormal_types, descriptions):
+    for device in msg.get("device_results", []):
+        device_id = device.get("device_id", "unknown")
+        vibration_score = float(device.get("vibration_score", 0.0) or 0.0)
+        _push_history("monitor:%s:device:%s:vibration_history" % (monitor_id, device_id), vibration_score)
+        danger_threshold = float(_config_value("JUDGE", "VIBRATION_DANGER_THRESHOLD", DEFAULT_VIBRATION_DANGER_THRESHOLD))
+        if device.get("vibration_level") == "danger" or vibration_score >= danger_threshold:
+            abnormal_types.append("device_vibration")
+            descriptions.append("\u8bbe\u5907%s\u5b58\u5728\u5f02\u5e38\u9707\u52a8\uff0c\u9707\u52a8\u5206\u6570%.4f" % (
+                device_id, vibration_score))
+
+
 def _accumulate_static_duration(monitor_id, person_id, msg):
-    start_key = "monitor:%s:person:%s:static_start_time" % (monitor_id, person_id)
-    duration_key = "monitor:%s:person:%s:static_duration" % (monitor_id, person_id)
-    seen_key = "monitor:%s:person:%s:last_seen_time" % (monitor_id, person_id)
+    return _accumulate_condition_duration(monitor_id, "person:%s:static" % person_id, msg)
+
+
+def _accumulate_condition_duration(monitor_id, condition_key, msg):
+    start_key = "monitor:%s:%s:start_time" % (monitor_id, condition_key)
+    duration_key = "monitor:%s:%s:duration" % (monitor_id, condition_key)
+    seen_key = "monitor:%s:%s:last_seen_time" % (monitor_id, condition_key)
     now = _parse_time(msg.get("end_time")) or dt.datetime.now()
 
     start_raw = _get_key(start_key)
     if start_raw:
-        start = _parse_time(start_raw)
+        start = _parse_time(start_raw) or now
     else:
         start = _parse_time(msg.get("start_time")) or now
         _set_key(start_key, _format_dt(start), 86400)
@@ -142,12 +258,29 @@ def _accumulate_static_duration(monitor_id, person_id, msg):
     return duration
 
 
+def _delete_condition(monitor_id, condition_key):
+    _delete_key("monitor:%s:%s:start_time" % (monitor_id, condition_key))
+    _delete_key("monitor:%s:%s:duration" % (monitor_id, condition_key))
+    _delete_key("monitor:%s:%s:last_seen_time" % (monitor_id, condition_key))
+
+
+def _posture_name(value):
+    return {"bend": "\u5f2f\u8170", "squat": "\u8e72\u4e0b", "horizontal": "\u6a2a\u5411"}.get(value, value)
+
+
 def _event_level(types):
-    if "device_vibration" in types and "person_static" in types:
+    high_types = {"device_vibration", "person_fall", "fall_no_movement"}
+    medium_types = {
+        "person_static",
+        "abnormal_posture",
+        "person_absent",
+        "crowd_gathering",
+        "person_running",
+        "help_gesture",
+    }
+    if high_types.intersection(types):
         return "high"
-    if "device_vibration" in types:
-        return "high"
-    if "person_static" in types:
+    if medium_types.intersection(types):
         return "medium"
     return "low"
 

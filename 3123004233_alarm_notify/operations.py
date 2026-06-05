@@ -437,19 +437,19 @@ def _alarm_result(event, triggered, methods, message, notify_status, sound_statu
 
 def _message(event):
     lines = [
-        _u("车间检测到异常行为：%s。请及时处理。") % _event_description(event),
-        _u("事件时间：%s") % (event.get("event_time") or _now_text()),
-        _u("异常等级：%s") % event.get("abnormal_level", "unknown"),
-        _u("异常类型：%s") % ", ".join(event.get("abnormal_types", []) or ["unknown"]),
+        "\u8f66\u95f4\u68c0\u6d4b\u5230\u5f02\u5e38\u884c\u4e3a\uff1a%s\u3002\u8bf7\u53ca\u65f6\u5904\u7406\u3002" % _event_description(event),
+        "\u4e8b\u4ef6\u65f6\u95f4\uff1a%s" % (event.get("event_time") or _now_text()),
+        "\u5f02\u5e38\u7b49\u7ea7\uff1a%s" % event.get("abnormal_level", "unknown"),
+        "\u5f02\u5e38\u7c7b\u578b\uff1a%s" % ", ".join(event.get("abnormal_types", []) or ["unknown"]),
     ]
     if event.get("camera_id"):
-        lines.append(_u("摄像头：%s") % event.get("camera_id"))
+        lines.append("\u6444\u50cf\u5934\uff1a%s" % event.get("camera_id"))
     if event.get("clip_id"):
-        lines.append(_u("视频片段：%s") % event.get("clip_id"))
+        lines.append("\u89c6\u9891\u7247\u6bb5\uff1a%s" % event.get("clip_id"))
     if event.get("evidence_frame_url"):
-        lines.append(_u("证据图片：%s") % event.get("evidence_frame_url"))
+        lines.append("\u8bc1\u636e\u56fe\u7247\uff1a%s" % event.get("evidence_frame_url"))
     if event.get("evidence_video_url"):
-        lines.append(_u("证据视频：%s") % event.get("evidence_video_url"))
+        lines.append("\u8bc1\u636e\u89c6\u9891\uff1a%s" % event.get("evidence_video_url"))
     return "\n".join(lines)
 
 
@@ -461,26 +461,31 @@ def _event_description(event):
     names = []
     for item in event.get("abnormal_types", []) or []:
         names.append(_type_name(item))
-    return _u("，").join(names) if names else _u("未知异常")
+    return "\uff0c".join(names) if names else "\u672a\u77e5\u5f02\u5e38"
 
 
 def _type_name(item):
     return {
-        "person_static": _u("人员长时间静止"),
-        "person_fall": _u("人员疑似跌倒"),
-        "person_intrusion": _u("人员进入危险区域"),
-        "device_vibration": _u("设备异常震动"),
-        "device_stop": _u("设备异常停机"),
-        "unknown_abnormal": _u("未知异常"),
+        "person_static": "\u4eba\u5458\u957f\u65f6\u95f4\u9759\u6b62",
+        "person_fall": "\u4eba\u5458\u7591\u4f3c\u8dcc\u5012",
+        "person_intrusion": "\u4eba\u5458\u8fdb\u5165\u5371\u9669\u533a\u57df",
+        "abnormal_posture": "\u4eba\u5458\u5f2f\u8170\u6216\u8e72\u4e0b\u65f6\u95f4\u8fc7\u957f",
+        "person_absent": "\u4eba\u5458\u957f\u65f6\u95f4\u79bb\u5c97",
+        "crowd_gathering": "\u4eba\u5458\u805a\u96c6\u5f02\u5e38",
+        "person_running": "\u4eba\u5458\u5feb\u901f\u5954\u8dd1\u6216\u5f02\u5e38\u79fb\u52a8",
+        "help_gesture": "\u4eba\u5458\u6325\u624b\u6c42\u52a9\u6216\u5f02\u5e38\u6325\u52a8",
+        "fall_no_movement": "\u4eba\u5458\u5012\u5730\u540e\u65e0\u52a8\u4f5c",
+        "device_vibration": "\u8bbe\u5907\u5f02\u5e38\u9707\u52a8",
+        "device_stop": "\u8bbe\u5907\u5f02\u5e38\u505c\u673a",
+        "unknown_abnormal": "\u672a\u77e5\u5f02\u5e38",
     }.get(item, item)
 
 
 def _looks_garbled(text):
     if not text:
         return True
-    question_count = text.count("?") + text.count(_u("？"))
+    question_count = text.count("?") + text.count("\ufffd")
     return question_count >= 3 or question_count >= max(1, len(text) // 3)
-
 
 def _create_consumer(topic, group_id):
     return KafkaConsumer(
