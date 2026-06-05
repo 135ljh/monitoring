@@ -115,7 +115,7 @@ def _recognize_message(msg):
     annotated_path = temp_dir / ("%s_annotated.mp4" % clip_id)
     annotated_frame_path = temp_dir / ("%s_annotated.jpg" % clip_id)
 
-    max_age = float(_config_value("RECOGNITION", "MAX_CLIP_AGE_SECONDS", 90))
+    max_age = float(_config_value("RECOGNITION", "MAX_CLIP_AGE_SECONDS", 30))
     age = _message_age_seconds(msg)
     if age is not None and age > max_age:
         raise RuntimeError("skip stale processed video clip %s, age %.1fs > %.1fs" % (clip_id, age, max_age))
@@ -337,8 +337,8 @@ def _run_yolo_person_detector(source_path, width, height):
     if not cap.isOpened():
         return []
     fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
-    frame_step = max(1, int(float(_config_value("YOLO", "FRAME_INTERVAL_SECONDS", 2.0)) * fps))
-    max_frames = int(_config_value("YOLO", "MAX_FRAMES", 5))
+    frame_step = max(1, int(float(_config_value("YOLO", "FRAME_INTERVAL_SECONDS", 1.0)) * fps))
+    max_frames = int(_config_value("YOLO", "MAX_FRAMES", 3))
     conf_threshold = float(_config_value("YOLO", "CONFIDENCE", 0.45))
     imgsz = int(_config_value("YOLO", "IMAGE_SIZE", 640))
     boxes = []
@@ -363,7 +363,7 @@ def _run_yolo_person_detector(source_path, width, height):
             ok, frame = cap.read()
     finally:
         cap.release()
-    return _dedupe_yolo_boxes(boxes, width, height)[:int(_config_value("YOLO", "MAX_PEOPLE", 3))]
+    return _dedupe_yolo_boxes(boxes, width, height)[:int(_config_value("YOLO", "MAX_PEOPLE", 6))]
 
 
 def _load_yolo_model():
@@ -419,7 +419,7 @@ def _dedupe_yolo_boxes(boxes, width, height):
 
 def _filter_openpose_results_by_yolo(person_results, yolo_boxes, width, height):
     filtered = []
-    min_iou = float(_config_value("YOLO", "OPENPOSE_IOU_THRESHOLD", 0.10))
+    min_iou = float(_config_value("YOLO", "OPENPOSE_IOU_THRESHOLD", 0.05))
     for item in person_results:
         bbox = item.get("bbox") or []
         if len(bbox) != 4:
@@ -428,6 +428,7 @@ def _filter_openpose_results_by_yolo(person_results, yolo_boxes, width, height):
         if not matches:
             continue
         best = max(matches, key=lambda box: box.get("confidence", 0.0))
+        item["bbox"] = best["bbox"]
         item["detector_backend"] = "yolo"
         item["detector_confidence"] = round(float(best.get("confidence", 0.0)), 4)
         filtered.append(item)
@@ -489,7 +490,7 @@ def _fallback_person_results(deduped_boxes, sampled_person_boxes, width, height,
             continue
         posture_type, posture_score = _posture_from_box(box, width, height)
         fall_suspected = _fall_suspected(box, width, height, posture_type, bool(deduped_boxes))
-        running_suspected = center_speed >= float(_config_value("RECOGNITION", "RUNNING_SPEED_THRESHOLD", 0.22))
+        running_suspected = center_speed >= float(_config_value("RECOGNITION", "RUNNING_SPEED_THRESHOLD", 0.06))
         help_suspected = _help_gesture_suspected(upper_motion_score, movement_score, posture_type)
         person_results.append({
             "person_id": "P%03d" % (idx + 1),
@@ -530,17 +531,17 @@ def _run_openpose(source_path, width, height):
             "--model_pose", str(_config_value("OPENPOSE", "MODEL_POSE", "BODY_25")),
             "--number_people_max", str(int(_config_value("OPENPOSE", "NUMBER_PEOPLE_MAX", 10))),
         ]
-        frame_step = int(_config_value("OPENPOSE", "FRAME_STEP", 3))
+        frame_step = int(_config_value("OPENPOSE", "FRAME_STEP", 8))
         if frame_step > 1:
             cmd.extend(["--frame_step", str(frame_step)])
-        net_resolution = str(_config_value("OPENPOSE", "NET_RESOLUTION", "") or "").strip()
+        net_resolution = str(_config_value("OPENPOSE", "NET_RESOLUTION", "-1x192") or "").strip()
         if net_resolution:
             cmd.extend(["--net_resolution", net_resolution])
         model_folder = _openpose_model_folder(exe_path)
         if model_folder:
             cmd.extend(["--model_folder", str(model_folder)])
 
-        timeout = int(_config_value("OPENPOSE", "TIMEOUT_SECONDS", 180))
+        timeout = int(_config_value("OPENPOSE", "TIMEOUT_SECONDS", 25))
         completed = subprocess.run(
             cmd,
             cwd=str(_openpose_root(exe_path)),
@@ -618,7 +619,7 @@ def _parse_openpose_json(json_dir, width, height):
             if keypoints is not None:
                 tracks[idx]["frames"].append(keypoints)
 
-    min_frames = int(_config_value("OPENPOSE", "MIN_VALID_FRAMES", 2))
+    min_frames = int(_config_value("OPENPOSE", "MIN_VALID_FRAMES", 1))
     return [
         track for track in tracks
         if len(track.get("frames", [])) >= min_frames and _valid_openpose_track(track, width, height)
@@ -658,7 +659,7 @@ def _openpose_person_results(tracks, width, height, movement_score, action_type)
         posture_type, posture_score = _posture_from_keypoints(frames, width, height)
         fall_suspected = _fall_from_keypoints(frames, width, height)
         help_suspected = _help_from_keypoints(frames, height)
-        running_suspected = center_speed >= float(_config_value("RECOGNITION", "RUNNING_SPEED_THRESHOLD", 0.22))
+        running_suspected = center_speed >= float(_config_value("RECOGNITION", "RUNNING_SPEED_THRESHOLD", 0.06))
         results.append({
             "person_id": "P%03d" % (idx + 1),
             "bbox": bbox,
@@ -691,10 +692,10 @@ def _valid_openpose_track(track, width, height):
     bbox_h = max(0, y2 - y1)
     area_ratio = (bbox_w * bbox_h) / float(max(1, width * height))
     height_ratio = bbox_h / float(max(1, height))
-    min_conf = float(_config_value("OPENPOSE", "MIN_PERSON_CONFIDENCE", 0.55))
-    min_points = int(_config_value("OPENPOSE", "MIN_VALID_KEYPOINTS", 8))
-    min_area = float(_config_value("OPENPOSE", "MIN_BBOX_AREA_RATIO", 0.05))
-    min_height = float(_config_value("OPENPOSE", "MIN_BBOX_HEIGHT_RATIO", 0.35))
+    min_conf = float(_config_value("OPENPOSE", "MIN_PERSON_CONFIDENCE", 0.40))
+    min_points = int(_config_value("OPENPOSE", "MIN_VALID_KEYPOINTS", 5))
+    min_area = float(_config_value("OPENPOSE", "MIN_BBOX_AREA_RATIO", 0.03))
+    min_height = float(_config_value("OPENPOSE", "MIN_BBOX_HEIGHT_RATIO", 0.25))
     if confidence < min_conf or valid_count < min_points:
         return False
     if area_ratio < min_area or height_ratio < min_height:

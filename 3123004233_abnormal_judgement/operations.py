@@ -17,14 +17,14 @@ RECOGNITION_RESULT_TOPIC = "workshop.recognition_result"
 ABNORMAL_EVENT_TOPIC = "workshop.abnormal_event"
 DEFAULT_GROUP = "workshop-abnormal-judgement"
 
-DEFAULT_STATIC_SECONDS = 10.0
+DEFAULT_STATIC_SECONDS = 6.0
 DEFAULT_FALL_SECONDS = 3.0
-DEFAULT_ABNORMAL_POSTURE_SECONDS = 20.0
-DEFAULT_PERSON_ABSENT_SECONDS = 60.0
+DEFAULT_ABNORMAL_POSTURE_SECONDS = 6.0
+DEFAULT_PERSON_ABSENT_SECONDS = 10.0
 DEFAULT_CROWD_SECONDS = 10.0
-DEFAULT_RUNNING_SECONDS = 2.0
-DEFAULT_HELP_GESTURE_SECONDS = 2.0
-DEFAULT_FALL_NO_MOVEMENT_SECONDS = 10.0
+DEFAULT_RUNNING_SECONDS = 1.0
+DEFAULT_HELP_GESTURE_SECONDS = 1.0
+DEFAULT_FALL_NO_MOVEMENT_SECONDS = 6.0
 DEFAULT_CROWD_PERSON_THRESHOLD = 5
 DEFAULT_VIBRATION_DANGER_THRESHOLD = 0.006
 DEFAULT_SENSOR_POLL_INTERVAL = 2.0
@@ -463,7 +463,7 @@ def _judge_person_fall(monitor_id, msg, person, person_id, abnormal_types, descr
 
 def _judge_abnormal_posture(monitor_id, msg, person, person_id, abnormal_types, descriptions):
     condition = "person:%s:abnormal_posture" % person_id
-    if not _config_bool("JUDGE", "ENABLE_ABNORMAL_POSTURE_RULE", False):
+    if not _config_bool("JUDGE", "ENABLE_ABNORMAL_POSTURE_RULE", True):
         _delete_condition(monitor_id, condition)
         return
     posture_type = person.get("posture_type")
@@ -479,10 +479,10 @@ def _judge_abnormal_posture(monitor_id, msg, person, person_id, abnormal_types, 
 
 def _judge_person_running(monitor_id, msg, person, person_id, abnormal_types, descriptions):
     condition = "person:%s:running" % person_id
-    if not _config_bool("JUDGE", "ENABLE_RUNNING_RULE", False):
+    if not _config_bool("JUDGE", "ENABLE_RUNNING_RULE", True):
         _delete_condition(monitor_id, condition)
         return
-    min_motion = float(_config_value("JUDGE", "RUNNING_MIN_MOTION_SCORE", 0.035))
+    min_motion = float(_config_value("JUDGE", "RUNNING_MIN_MOTION_SCORE", 0.015))
     if not person.get("running_suspected") or float(person.get("movement_score", 0.0) or 0.0) < min_motion:
         _delete_condition(monitor_id, condition)
         return
@@ -529,7 +529,7 @@ def _judge_person_absent(monitor_id, msg, scene, abnormal_types, descriptions):
 
 def _judge_crowd_gathering(monitor_id, msg, scene, abnormal_types, descriptions):
     condition = "scene:crowd_gathering"
-    if not _config_bool("JUDGE", "ENABLE_CROWD_RULE", False):
+    if not _config_bool("JUDGE", "ENABLE_CROWD_RULE", True):
         _delete_condition(monitor_id, condition)
         return
     person_count = int(scene.get("crowd_count", scene.get("person_count", 0)) or 0)
@@ -558,19 +558,19 @@ def _judge_device_vibration(monitor_id, msg, abnormal_types, descriptions):
 
 def _valid_person_for_judge(person):
     confidence = float(person.get("confidence", 0.0) or 0.0)
-    min_confidence = float(_config_value("JUDGE", "MIN_PERSON_CONFIDENCE", 0.55))
+    min_confidence = float(_config_value("JUDGE", "MIN_PERSON_CONFIDENCE", 0.40))
     if confidence < min_confidence:
         return False
     valid_keypoints = int(person.get("valid_keypoint_count", 0) or 0)
-    if person.get("keypoint_backend") == "openpose" and valid_keypoints < int(_config_value("JUDGE", "MIN_VALID_KEYPOINTS", 8)):
+    if person.get("keypoint_backend") == "openpose" and valid_keypoints < int(_config_value("JUDGE", "MIN_VALID_KEYPOINTS", 5)):
         return False
     bbox = person.get("bbox") or []
     if len(bbox) == 4:
         width = max(0, float(bbox[2]) - float(bbox[0]))
         height = max(0, float(bbox[3]) - float(bbox[1]))
-        if width * height < float(_config_value("JUDGE", "MIN_PERSON_BBOX_AREA", 25000)):
+        if width * height < float(_config_value("JUDGE", "MIN_PERSON_BBOX_AREA", 12000)):
             return False
-        if height < float(_config_value("JUDGE", "MIN_PERSON_BBOX_HEIGHT", 180)):
+        if height < float(_config_value("JUDGE", "MIN_PERSON_BBOX_HEIGHT", 100)):
             return False
     return True
 
