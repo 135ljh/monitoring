@@ -27,6 +27,8 @@ DEFAULT_HELP_GESTURE_SECONDS = 1.0
 DEFAULT_FALL_NO_MOVEMENT_SECONDS = 6.0
 DEFAULT_CROWD_PERSON_THRESHOLD = 5
 DEFAULT_VIBRATION_DANGER_THRESHOLD = 0.006
+DEFAULT_STATIC_CENTER_DELTA = 0.035
+DEFAULT_RUNNING_CENTER_DELTA = 0.12
 DEFAULT_SENSOR_POLL_INTERVAL = 2.0
 DEFAULT_SENSOR_PLC_IP = "10.21.2.233"
 DEFAULT_SENSOR_PLC_PORT = 502
@@ -406,6 +408,7 @@ def _judge_message(msg):
         if not _valid_person_for_judge(person):
             _delete_all_person_conditions(monitor_id, person_id)
             continue
+        person["_center_delta"] = _update_person_center_delta(monitor_id, person_id, person)
         _judge_person_static(monitor_id, msg, person, person_id, abnormal_types, descriptions)
         _judge_person_fall(monitor_id, msg, person, person_id, abnormal_types, descriptions)
         _judge_abnormal_posture(monitor_id, msg, person, person_id, abnormal_types, descriptions)
@@ -441,7 +444,11 @@ def _judge_person_static(monitor_id, msg, person, person_id, abnormal_types, des
     if not _config_bool("JUDGE", "ENABLE_STATIC_RULE", True):
         _delete_condition(monitor_id, condition)
         return
-    if person.get("action_type") != "static":
+    center_delta = person.get("_center_delta")
+    max_delta = float(_config_value("JUDGE", "STATIC_CENTER_DELTA", DEFAULT_STATIC_CENTER_DELTA))
+    center_static = center_delta is not None and float(center_delta) <= max_delta
+    speed_static = float(person.get("center_speed", 0.0) or 0.0) <= max_delta
+    if person.get("action_type") != "static" and not center_static and not speed_static:
         _delete_condition(monitor_id, condition)
         return
     duration = _accumulate_condition_duration(monitor_id, condition, msg)
@@ -483,7 +490,10 @@ def _judge_person_running(monitor_id, msg, person, person_id, abnormal_types, de
         _delete_condition(monitor_id, condition)
         return
     min_motion = float(_config_value("JUDGE", "RUNNING_MIN_MOTION_SCORE", 0.015))
-    if not person.get("running_suspected") or float(person.get("movement_score", 0.0) or 0.0) < min_motion:
+    center_delta = person.get("_center_delta")
+    running_delta = center_delta is not None and float(center_delta) >= float(
+        _config_value("JUDGE", "RUNNING_CENTER_DELTA", DEFAULT_RUNNING_CENTER_DELTA))
+    if not (person.get("running_suspected") or running_delta) or float(person.get("movement_score", 0.0) or 0.0) < min_motion:
         _delete_condition(monitor_id, condition)
         return
     duration = _accumulate_condition_duration(monitor_id, condition, msg)
@@ -575,9 +585,39 @@ def _valid_person_for_judge(person):
     return True
 
 
+def _update_person_center_delta(monitor_id, person_id, person):
+    center_info = _bbox_center_info(person.get("bbox") or [])
+    if center_info is None:
+        return None
+    cx, cy, scale = center_info
+    key = "monitor:%s:person:%s:last_center" % (monitor_id, person_id)
+    previous_raw = _get_key(key)
+    _set_key(key, "%.6f,%.6f" % (cx, cy), 86400)
+    if not previous_raw:
+        return None
+    try:
+        px, py = [float(item) for item in str(previous_raw).split(",", 1)]
+    except Exception:
+        return None
+    dx = cx - px
+    dy = cy - py
+    return ((dx * dx + dy * dy) ** 0.5) / max(1.0, scale)
+
+
+def _bbox_center_info(bbox):
+    if len(bbox) != 4:
+        return None
+    x1, y1, x2, y2 = [float(value) for value in bbox]
+    width = max(1.0, x2 - x1)
+    height = max(1.0, y2 - y1)
+    scale = max(width, height)
+    return (x1 + x2) / 2.0, (y1 + y2) / 2.0, scale
+
+
 def _delete_all_person_conditions(monitor_id, person_id):
     for suffix in ("static", "fall", "abnormal_posture", "running", "help_gesture", "fall_no_movement"):
         _delete_condition(monitor_id, "person:%s:%s" % (person_id, suffix))
+    _delete_key("monitor:%s:person:%s:last_center" % (monitor_id, person_id))
 
 
 def _accumulate_static_duration(monitor_id, person_id, msg):

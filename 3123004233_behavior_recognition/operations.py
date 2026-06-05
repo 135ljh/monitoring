@@ -227,7 +227,7 @@ def _analyze_video(source_path, annotated_path, annotated_frame_path):
         else:
             person_results = []
         if not person_results:
-            person_results = _yolo_person_results(yolo_boxes, movement_score, action_type)
+            person_results = _yolo_person_results(yolo_boxes, width, height, movement_score, action_type)
         person_count = len(person_results)
         pose_backend = "yolo_openpose" if any(item.get("keypoint_backend") == "openpose" for item in person_results) else "yolo"
     else:
@@ -435,18 +435,22 @@ def _filter_openpose_results_by_yolo(person_results, yolo_boxes, width, height):
     return filtered
 
 
-def _yolo_person_results(yolo_boxes, movement_score, action_type):
+def _yolo_person_results(yolo_boxes, width, height, movement_score, action_type):
     results = []
     for idx, item in enumerate(yolo_boxes):
+        x1, y1, x2, y2 = item["bbox"]
+        box = [x1, y1, max(1, x2 - x1), max(1, y2 - y1)]
+        posture_type, posture_score = _posture_from_box(box, width, height)
+        fall_suspected = _fall_suspected(box, width, height, posture_type, True)
         results.append({
             "person_id": "P%03d" % (idx + 1),
             "bbox": item["bbox"],
             "action_type": action_type,
             "movement_score": movement_score,
             "center_speed": 0.0,
-            "posture_type": "standing",
-            "posture_score": 0.0,
-            "fall_suspected": False,
+            "posture_type": posture_type,
+            "posture_score": round(posture_score, 4),
+            "fall_suspected": fall_suspected,
             "running_suspected": False,
             "help_gesture_suspected": False,
             "keypoint_backend": "none",
