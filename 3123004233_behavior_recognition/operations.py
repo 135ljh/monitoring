@@ -227,7 +227,7 @@ def _analyze_video(source_path, annotated_path, annotated_frame_path):
         else:
             person_results = []
         if not person_results:
-            person_results = _yolo_person_results(yolo_boxes, width, height, movement_score, action_type)
+            person_results = _yolo_person_results(yolo_boxes, width, height, movement_score, upper_motion_score, action_type)
         person_count = len(person_results)
         pose_backend = "yolo_openpose" if any(item.get("keypoint_backend") == "openpose" for item in person_results) else "yolo"
     else:
@@ -435,13 +435,14 @@ def _filter_openpose_results_by_yolo(person_results, yolo_boxes, width, height):
     return filtered
 
 
-def _yolo_person_results(yolo_boxes, width, height, movement_score, action_type):
+def _yolo_person_results(yolo_boxes, width, height, movement_score, upper_motion_score, action_type):
     results = []
     for idx, item in enumerate(yolo_boxes):
         x1, y1, x2, y2 = item["bbox"]
         box = [x1, y1, max(1, x2 - x1), max(1, y2 - y1)]
         posture_type, posture_score = _posture_from_box(box, width, height)
         fall_suspected = _fall_suspected(box, width, height, posture_type, True)
+        help_suspected = _help_gesture_suspected(upper_motion_score, movement_score, posture_type)
         results.append({
             "person_id": "P%03d" % (idx + 1),
             "bbox": item["bbox"],
@@ -452,7 +453,7 @@ def _yolo_person_results(yolo_boxes, width, height, movement_score, action_type)
             "posture_score": round(posture_score, 4),
             "fall_suspected": fall_suspected,
             "running_suspected": False,
-            "help_gesture_suspected": False,
+            "help_gesture_suspected": help_suspected,
             "keypoint_backend": "none",
             "detector_backend": "yolo",
             "detector_confidence": round(float(item.get("confidence", 0.0)), 4),
@@ -535,10 +536,10 @@ def _run_openpose(source_path, width, height):
             "--model_pose", str(_config_value("OPENPOSE", "MODEL_POSE", "BODY_25")),
             "--number_people_max", str(int(_config_value("OPENPOSE", "NUMBER_PEOPLE_MAX", 10))),
         ]
-        frame_step = int(_config_value("OPENPOSE", "FRAME_STEP", 8))
+        frame_step = int(_config_value("OPENPOSE", "FRAME_STEP", 4))
         if frame_step > 1:
             cmd.extend(["--frame_step", str(frame_step)])
-        net_resolution = str(_config_value("OPENPOSE", "NET_RESOLUTION", "-1x192") or "").strip()
+        net_resolution = str(_config_value("OPENPOSE", "NET_RESOLUTION", "-1x256") or "").strip()
         if net_resolution:
             cmd.extend(["--net_resolution", net_resolution])
         model_folder = _openpose_model_folder(exe_path)
@@ -787,11 +788,19 @@ def _fall_from_keypoints(frames, width, height):
     torso_angle = _torso_angle_from_horizontal(keypoints)
     head = _point(keypoints, "nose") or _point(keypoints, "neck")
     hip = _point(keypoints, "mid_hip")
-    if torso_angle is None or head is None:
+    bbox = _keypoint_bbox(keypoints, width, height)
+    bbox_w = max(1.0, float(bbox[2] - bbox[0]))
+    bbox_h = max(1.0, float(bbox[3] - bbox[1]))
+    aspect = bbox_w / bbox_h
+    bottom_ratio = float(bbox[3]) / max(1.0, float(height))
+    if torso_angle is None and aspect < float(_config_value("RECOGNITION", "FALL_ASPECT_THRESHOLD", 1.35)):
         return False
-    head_low = head[1] >= height * float(_config_value("OPENPOSE", "FALL_HEAD_LOW_RATIO", 0.45))
+    head_low = head is not None and head[1] >= height * float(_config_value("OPENPOSE", "FALL_HEAD_LOW_RATIO", 0.45))
     hip_low = hip is not None and hip[1] >= height * float(_config_value("OPENPOSE", "FALL_HIP_LOW_RATIO", 0.50))
-    return torso_angle <= float(_config_value("OPENPOSE", "FALL_TORSO_ANGLE", 35)) and (head_low or hip_low)
+    torso_horizontal = torso_angle is not None and torso_angle <= float(_config_value("OPENPOSE", "FALL_TORSO_ANGLE", 35))
+    bbox_horizontal = aspect >= float(_config_value("RECOGNITION", "FALL_ASPECT_THRESHOLD", 1.35))
+    body_low = bottom_ratio >= float(_config_value("RECOGNITION", "FALL_BOTTOM_RATIO", 0.55))
+    return (torso_horizontal or bbox_horizontal) and body_low and (head_low or hip_low or bbox_horizontal)
 
 
 def _help_from_keypoints(frames, height):
@@ -812,6 +821,9 @@ def _help_from_keypoints(frames, height):
             raised_frames += 1
     if raised_frames < int(_config_value("OPENPOSE", "HELP_MIN_RAISED_FRAMES", 2)):
         return False
+    raised_ratio = raised_frames / max(1.0, float(len(frames)))
+    if raised_ratio >= float(_config_value("OPENPOSE", "HELP_RAISED_FRAME_RATIO", 0.45)):
+        return True
     if len(wrist_y_values) < 2:
         return True
     amplitude = max(wrist_y_values) - min(wrist_y_values)
@@ -906,7 +918,12 @@ def _posture_from_box(box, width, height):
     height_ratio = float(h) / max(1.0, float(height))
     center_y = (float(y) + h / 2.0) / max(1.0, float(height))
 
-    if aspect >= float(_config_value("RECOGNITION", "FALL_ASPECT_THRESHOLD", 1.15)):
+    bottom_ratio = float(y + h) / max(1.0, float(height))
+
+    if (
+        aspect >= float(_config_value("RECOGNITION", "FALL_ASPECT_THRESHOLD", 1.35))
+        and bottom_ratio >= float(_config_value("RECOGNITION", "FALL_BOTTOM_RATIO", 0.55))
+    ):
         return "horizontal", aspect
     if height_ratio <= float(_config_value("RECOGNITION", "SQUAT_HEIGHT_RATIO", 0.42)) and center_y > 0.45:
         return "squat", height_ratio
@@ -921,7 +938,11 @@ def _fall_suspected(box, width, height, posture_type, detected):
     _, y, w, h = box
     aspect = float(w) / max(1.0, float(h))
     bottom_ratio = float(y + h) / max(1.0, float(height))
-    return posture_type == "horizontal" and aspect >= 1.15 and bottom_ratio >= 0.55
+    return (
+        posture_type == "horizontal"
+        and aspect >= float(_config_value("RECOGNITION", "FALL_ASPECT_THRESHOLD", 1.35))
+        and bottom_ratio >= float(_config_value("RECOGNITION", "FALL_BOTTOM_RATIO", 0.55))
+    )
 
 
 def _help_gesture_suspected(upper_motion_score, movement_score, posture_type):
