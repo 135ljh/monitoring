@@ -40,6 +40,8 @@ BODY_25 = {
 
 _TASKS = {}
 _LOCK = threading.Lock()
+_YOLO_MODEL = None
+_YOLO_LOCK = threading.Lock()
 
 
 def start_recognize(data):
@@ -219,16 +221,28 @@ def _analyze_video(source_path, annotated_path, annotated_frame_path):
     vibration_level = _vibration_level(vibration_score)
 
     deduped_boxes = _dedupe_boxes(person_boxes)
-    openpose_tracks = _run_openpose(source_path, width, height)
-    if openpose_tracks:
-        person_results = _openpose_person_results(openpose_tracks, width, height, movement_score, action_type)
+    yolo_boxes = _run_yolo_person_detector(source_path, width, height)
+    if yolo_boxes:
+        openpose_tracks = _run_openpose(source_path, width, height)
+        if openpose_tracks:
+            openpose_results = _openpose_person_results(openpose_tracks, width, height, movement_score, action_type)
+            person_results = _filter_openpose_results_by_yolo(openpose_results, yolo_boxes, width, height)
+        else:
+            person_results = []
+        if not person_results:
+            person_results = _yolo_person_results(yolo_boxes, movement_score, action_type)
         person_count = len(person_results)
-        pose_backend = "openpose"
+        pose_backend = "yolo_openpose" if any(item.get("keypoint_backend") == "openpose" for item in person_results) else "yolo"
     else:
-        person_results = _fallback_person_results(
-            deduped_boxes, sampled_person_boxes, width, height, movement_score, upper_motion_score, action_type)
-        person_count = len(deduped_boxes)
-        pose_backend = "opencv_hog"
+        if _config_bool("YOLO", "REQUIRE_PERSON_GATE", True):
+            person_results = []
+            person_count = 0
+            pose_backend = "yolo_no_person"
+        else:
+            person_results = _fallback_person_results(
+                deduped_boxes, sampled_person_boxes, width, height, movement_score, upper_motion_score, action_type)
+            person_count = len(person_results)
+            pose_backend = "opencv_hog"
 
     device_results = [{
         "device_id": _config_value("RECOGNITION", "DEVICE_ID", "DEV_001"),
@@ -247,6 +261,156 @@ def _analyze_video(source_path, annotated_path, annotated_frame_path):
     }
 
     return {"person_results": person_results, "device_results": device_results, "scene_result": scene_result}
+
+
+def _run_yolo_person_detector(source_path, width, height):
+    if not _config_bool("YOLO", "ENABLED", True):
+        return []
+    model = _load_yolo_model()
+    if model is None:
+        return []
+
+    cap = cv2.VideoCapture(str(source_path))
+    if not cap.isOpened():
+        return []
+    fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+    frame_step = max(1, int(float(_config_value("YOLO", "FRAME_INTERVAL_SECONDS", 2.0)) * fps))
+    max_frames = int(_config_value("YOLO", "MAX_FRAMES", 5))
+    conf_threshold = float(_config_value("YOLO", "CONFIDENCE", 0.45))
+    imgsz = int(_config_value("YOLO", "IMAGE_SIZE", 640))
+    boxes = []
+    frame_index = 0
+    sampled = 0
+    try:
+        ok, frame = cap.read()
+        while ok and frame is not None and sampled < max_frames:
+            if frame_index % frame_step == 0:
+                results = model.predict(frame, imgsz=imgsz, conf=conf_threshold, classes=[0], verbose=False)
+                for result in results:
+                    if result.boxes is None:
+                        continue
+                    xyxy = result.boxes.xyxy.cpu().numpy()
+                    confs = result.boxes.conf.cpu().numpy()
+                    for box, conf in zip(xyxy, confs):
+                        x1, y1, x2, y2 = [int(v) for v in box]
+                        if _valid_yolo_box([x1, y1, x2, y2], width, height):
+                            boxes.append({"bbox": [x1, y1, x2, y2], "confidence": float(conf)})
+                sampled += 1
+            frame_index += 1
+            ok, frame = cap.read()
+    finally:
+        cap.release()
+    return _dedupe_yolo_boxes(boxes, width, height)[:int(_config_value("YOLO", "MAX_PEOPLE", 3))]
+
+
+def _load_yolo_model():
+    global _YOLO_MODEL
+    with _YOLO_LOCK:
+        if _YOLO_MODEL is not None:
+            return _YOLO_MODEL
+        try:
+            from ultralytics import YOLO
+
+            model_path = _resolve_model_path(_config_value("YOLO", "MODEL_PATH", "models/yolov8n.pt"))
+            _YOLO_MODEL = YOLO(str(model_path))
+            return _YOLO_MODEL
+        except Exception as exc:
+            if _config_bool("YOLO", "REQUIRE_YOLO", False):
+                raise RuntimeError("YOLO unavailable: %s" % exc)
+            print("YOLO unavailable, skip person gate: %s" % exc)
+            return None
+
+
+def _resolve_model_path(value):
+    path = Path(str(value))
+    if path.exists():
+        return path
+    component_relative = Path(__file__).resolve().parent / path
+    if component_relative.exists():
+        return component_relative
+    repo_relative = Path(__file__).resolve().parent.parent / path
+    if repo_relative.exists():
+        return repo_relative
+    return path
+
+
+def _valid_yolo_box(box, width, height):
+    x1, y1, x2, y2 = box
+    w = max(0, x2 - x1)
+    h = max(0, y2 - y1)
+    area_ratio = (w * h) / float(max(1, width * height))
+    height_ratio = h / float(max(1, height))
+    return (
+        area_ratio >= float(_config_value("YOLO", "MIN_BBOX_AREA_RATIO", 0.03))
+        and height_ratio >= float(_config_value("YOLO", "MIN_BBOX_HEIGHT_RATIO", 0.25))
+    )
+
+
+def _dedupe_yolo_boxes(boxes, width, height):
+    result = []
+    for item in sorted(boxes, key=lambda value: value.get("confidence", 0.0), reverse=True):
+        if not any(_iou_xyxy(item["bbox"], existing["bbox"]) > 0.45 for existing in result):
+            result.append(item)
+    return result
+
+
+def _filter_openpose_results_by_yolo(person_results, yolo_boxes, width, height):
+    filtered = []
+    min_iou = float(_config_value("YOLO", "OPENPOSE_IOU_THRESHOLD", 0.10))
+    for item in person_results:
+        bbox = item.get("bbox") or []
+        if len(bbox) != 4:
+            continue
+        matches = [box for box in yolo_boxes if _iou_xyxy(bbox, box["bbox"]) >= min_iou or _center_inside(bbox, box["bbox"])]
+        if not matches:
+            continue
+        best = max(matches, key=lambda box: box.get("confidence", 0.0))
+        item["detector_backend"] = "yolo"
+        item["detector_confidence"] = round(float(best.get("confidence", 0.0)), 4)
+        filtered.append(item)
+    return filtered
+
+
+def _yolo_person_results(yolo_boxes, movement_score, action_type):
+    results = []
+    for idx, item in enumerate(yolo_boxes):
+        results.append({
+            "person_id": "P%03d" % (idx + 1),
+            "bbox": item["bbox"],
+            "action_type": action_type,
+            "movement_score": movement_score,
+            "center_speed": 0.0,
+            "posture_type": "standing",
+            "posture_score": 0.0,
+            "fall_suspected": False,
+            "running_suspected": False,
+            "help_gesture_suspected": False,
+            "keypoint_backend": "none",
+            "detector_backend": "yolo",
+            "detector_confidence": round(float(item.get("confidence", 0.0)), 4),
+            "confidence": round(float(item.get("confidence", 0.0)), 4),
+        })
+    return results
+
+
+def _iou_xyxy(a, b):
+    ax1, ay1, ax2, ay2 = a
+    bx1, by1, bx2, by2 = b
+    ix1, iy1 = max(ax1, bx1), max(ay1, by1)
+    ix2, iy2 = min(ax2, bx2), min(ay2, by2)
+    inter = max(0, ix2 - ix1) * max(0, iy2 - iy1)
+    area_a = max(0, ax2 - ax1) * max(0, ay2 - ay1)
+    area_b = max(0, bx2 - bx1) * max(0, by2 - by1)
+    union = area_a + area_b - inter
+    return inter / union if union else 0.0
+
+
+def _center_inside(inner, outer):
+    x1, y1, x2, y2 = inner
+    ox1, oy1, ox2, oy2 = outer
+    cx = (x1 + x2) / 2.0
+    cy = (y1 + y2) / 2.0
+    return ox1 <= cx <= ox2 and oy1 <= cy <= oy2
 
 
 def _fallback_person_results(deduped_boxes, sampled_person_boxes, width, height, movement_score, upper_motion_score, action_type):
