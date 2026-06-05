@@ -36,7 +36,7 @@ DEFAULT_SENSOR_PLC_DEVICE_ID = 1
 DEFAULT_SENSOR_POINTS = [
     {"code": "voltage", "name": "\u7535\u538b", "address": "D2000", "scale": 0.1, "unit": "V", "min": 180.0, "max": 260.0},
     {"code": "current", "name": "\u7535\u6d41", "address": "D2001", "scale": 0.01, "unit": "A", "min": 0.0, "max": 20.0},
-    {"code": "active_power", "name": "\u77ac\u65f6\u6709\u529f\u529f\u7387", "address": "D2002", "scale": 1.0, "unit": "W", "min": 0.0, "max": 5000.0},
+    {"code": "active_power", "name": "\u77ac\u65f6\u6709\u529f\u529f\u7387", "address": "D2002", "scale": 1.0, "unit": "W", "min": 0.0, "max": 5000.0, "word_count": 2},
     {"code": "power_factor", "name": "\u529f\u7387\u56e0\u6570", "address": "D2003", "scale": 0.001, "unit": "COS", "min": 0.8, "max": 1.0},
     {"code": "frequency", "name": "\u9891\u7387", "address": "D2004", "scale": 0.01, "unit": "Hz", "min": 49.0, "max": 51.0},
     {"code": "total_energy", "name": "\u603b\u6709\u529f\u7535\u80fd", "address": "D2005", "scale": 0.01, "unit": "kWh"},
@@ -164,25 +164,25 @@ def _read_sensor_values():
     timeout = float(_config_value("SENSOR", "PLC_TIMEOUT", DEFAULT_SENSOR_PLC_TIMEOUT))
     device_id = int(_config_value("SENSOR", "PLC_DEVICE_ID", DEFAULT_SENSOR_PLC_DEVICE_ID))
 
-    addresses = sorted(set(_parse_plc_address(point["address"]) for point in points))
+    addresses = sorted(set(address for point in points for address in _point_addresses(point)))
     register_values = _read_sensor_registers(host, port, timeout, device_id, addresses)
 
     now = _now_text()
     readings = []
     for point in points:
         address = _parse_plc_address(point["address"])
-        raw = register_values.get(address)
-        if raw is None:
+        words = [register_values.get(address + offset) for offset in range(int(point.get("word_count", 1)))]
+        if any(word is None for word in words):
             continue
-        signed = _to_signed_16(raw) if _sensor_bool(point, "signed", False) else int(raw)
-        value = round(signed * float(point.get("scale", 1.0)), 4)
+        raw_value = _decode_sensor_words(words, point)
+        value = round(raw_value * float(point.get("scale", 1.0)), 4)
         status, reason = _sensor_status(point, value)
         readings.append({
             "panel_no": str(_config_value("SENSOR", "PANEL_NO", "4")),
             "sensor_code": point.get("code"),
             "sensor_name": point.get("name"),
             "address": point.get("address"),
-            "raw_value": signed,
+            "raw_value": raw_value,
             "value": value,
             "unit": point.get("unit", ""),
             "threshold_min": point.get("min"),
@@ -198,35 +198,47 @@ def _read_sensor_values():
 def _read_sensor_registers(host, port, timeout, device_id, addresses):
     if not addresses:
         return {}
-    chunk_size = int(_config_value("SENSOR", "READ_CHUNK_SIZE", 20))
+    if str(_config_value("SENSOR", "READ_MODE", "single")).lower() == "block":
+        return _read_sensor_registers_block(host, port, timeout, device_id, addresses)
+    return _read_sensor_registers_single(host, port, timeout, device_id, addresses)
+
+
+def _read_sensor_registers_single(host, port, timeout, device_id, addresses):
+    values = {}
+    client = ModbusTcpClient(host=host, port=port, timeout=timeout)
     try:
-        values = {}
-        start = addresses[0]
-        end = addresses[0]
-        groups = []
-        for address in addresses[1:]:
-            if address == end + 1 and (address - start + 1) <= chunk_size:
-                end = address
-            else:
-                groups.append((start, end))
-                start = address
-                end = address
-        groups.append((start, end))
-        for start, end in groups:
-            values.update(_read_holding_register_block(host, port, timeout, device_id, start, end - start + 1))
+        if not client.connect():
+            raise RuntimeError("cannot connect sensor PLC %s:%s" % (host, port))
+        for address in addresses:
+            response = client.read_holding_registers(address=address, count=1, device_id=device_id)
+            if isinstance(response, ModbusException):
+                raise RuntimeError("Modbus read failed at D%s: %s" % (address, response))
+            if response.isError():
+                error_code = getattr(response, "exception_code", response)
+                raise RuntimeError("PLC returned error at D%s: %s" % (address, error_code))
+            values[address] = response.registers[0]
         return values
-    except Exception as exc:
-        print("sensor block read failed, fallback to single reads: %s" % exc)
-        values = {}
-        max_single_reads = int(_config_value("SENSOR", "MAX_SINGLE_READS_ON_FALLBACK", 5))
-        for address in addresses[:max_single_reads]:
-            try:
-                values.update(_read_holding_register_block(host, port, timeout, device_id, address, 1))
-            except Exception as item_exc:
-                print("sensor register D%s read failed: %s" % (address, item_exc))
-        if not values:
-            raise
-        return values
+    finally:
+        client.close()
+
+
+def _read_sensor_registers_block(host, port, timeout, device_id, addresses):
+    values = {}
+    chunk_size = int(_config_value("SENSOR", "READ_CHUNK_SIZE", 20))
+    start = addresses[0]
+    end = addresses[0]
+    groups = []
+    for address in addresses[1:]:
+        if address == end + 1 and (address - start + 1) <= chunk_size:
+            end = address
+        else:
+            groups.append((start, end))
+            start = address
+            end = address
+    groups.append((start, end))
+    for start, end in groups:
+        values.update(_read_holding_register_block(host, port, timeout, device_id, start, end - start + 1))
+    return values
 
 
 def _read_holding_register_block(host, port, timeout, device_id, start, count):
@@ -346,9 +358,34 @@ def _parse_plc_address(address):
     return int(text)
 
 
+def _point_addresses(point):
+    start = _parse_plc_address(point["address"])
+    count = int(point.get("word_count", 1))
+    return [start + offset for offset in range(max(1, count))]
+
+
+def _decode_sensor_words(words, point):
+    values = [int(word) for word in words]
+    if int(point.get("word_count", 1)) <= 1:
+        value = values[0]
+        return _to_signed_16(value) if _sensor_bool(point, "signed", False) else value
+
+    order = str(point.get("word_order", _config_value("SENSOR", "DINT_WORD_ORDER", "high_low"))).lower()
+    if order in ("low_high", "little", "little_endian"):
+        combined = (values[1] << 16) | values[0]
+    else:
+        combined = (values[0] << 16) | values[1]
+    return _to_signed_32(combined) if _sensor_bool(point, "signed", True) else combined
+
+
 def _to_signed_16(value):
     value = int(value)
     return value - 65536 if value >= 32768 else value
+
+
+def _to_signed_32(value):
+    value = int(value)
+    return value - 4294967296 if value >= 2147483648 else value
 
 
 def _sensor_bool(point, key, default):
