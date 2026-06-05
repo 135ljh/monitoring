@@ -198,9 +198,6 @@ def _analyze_video(source_path, annotated_path, annotated_frame_path):
                     sampled_person_boxes.append(_dedupe_boxes(accepted))
 
             annotated = frame.copy()
-            for box in person_boxes[-3:]:
-                x, y, w, h = box
-                cv2.rectangle(annotated, (x, y), (x + w, y + h), (0, 0, 255), 2)
             x, y, w, h = device_roi
             cv2.rectangle(annotated, (x, y), (x + w, y + h), (0, 180, 255), 2)
             writer.write(annotated)
@@ -260,7 +257,73 @@ def _analyze_video(source_path, annotated_path, annotated_frame_path):
         "pose_backend": pose_backend,
     }
 
+    _rewrite_annotation_video(source_path, annotated_path, annotated_frame_path, person_results, device_roi, fps, width, height)
+
     return {"person_results": person_results, "device_results": device_results, "scene_result": scene_result}
+
+
+def _rewrite_annotation_video(source_path, annotated_path, annotated_frame_path, person_results, device_roi, fps, width, height):
+    cap = cv2.VideoCapture(str(source_path))
+    if not cap.isOpened():
+        return
+
+    tmp_path = annotated_path.with_name("%s_final%s" % (annotated_path.stem, annotated_path.suffix))
+    writer = cv2.VideoWriter(str(tmp_path), cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height))
+    if not writer.isOpened():
+        cap.release()
+        return
+
+    if annotated_frame_path.exists():
+        annotated_frame_path.unlink()
+
+    try:
+        ok, frame = cap.read()
+        while ok and frame is not None:
+            annotated = frame.copy()
+            _draw_device_roi(annotated, device_roi)
+            _draw_final_person_boxes(annotated, person_results)
+            writer.write(annotated)
+            if not annotated_frame_path.exists():
+                cv2.imwrite(str(annotated_frame_path), annotated)
+            ok, frame = cap.read()
+    finally:
+        writer.release()
+        cap.release()
+
+    tmp_path.replace(annotated_path)
+
+
+def _draw_device_roi(frame, device_roi):
+    x, y, w, h = device_roi
+    cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 180, 255), 2)
+    cv2.putText(frame, "device_roi", (x, max(18, y - 6)), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 180, 255), 2)
+
+
+def _draw_final_person_boxes(frame, person_results):
+    for item in person_results or []:
+        bbox = item.get("bbox") or []
+        if len(bbox) != 4:
+            continue
+        height, width = frame.shape[:2]
+        x1, y1, x2, y2 = _clamp_xyxy(bbox, width, height)
+        if x2 <= x1 or y2 <= y1:
+            continue
+        label = "%s %.2f %s" % (
+            item.get("person_id", "person"),
+            float(item.get("detector_confidence") or item.get("confidence") or 0.0),
+            item.get("detector_backend") or item.get("keypoint_backend") or "detector",
+        )
+        cv2.rectangle(frame, (x1, y1), (x2, y2), (30, 220, 30), 2)
+        cv2.putText(frame, label, (x1, max(18, y1 - 6)), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (30, 220, 30), 2)
+
+
+def _clamp_xyxy(bbox, width, height):
+    x1, y1, x2, y2 = [int(round(float(value))) for value in bbox]
+    x1 = max(0, min(width - 1, x1))
+    y1 = max(0, min(height - 1, y1))
+    x2 = max(0, min(width - 1, x2))
+    y2 = max(0, min(height - 1, y2))
+    return x1, y1, x2, y2
 
 
 def _run_yolo_person_detector(source_path, width, height):
