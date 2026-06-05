@@ -1,5 +1,6 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
+import datetime as dt
 import json
 import os
 import subprocess
@@ -111,6 +112,11 @@ def _recognize_message(msg):
     source_path = temp_dir / ("%s_processed.mp4" % clip_id)
     annotated_path = temp_dir / ("%s_annotated.mp4" % clip_id)
     annotated_frame_path = temp_dir / ("%s_annotated.jpg" % clip_id)
+
+    max_age = float(_config_value("RECOGNITION", "MAX_CLIP_AGE_SECONDS", 90))
+    age = _message_age_seconds(msg)
+    if age is not None and age > max_age:
+        raise RuntimeError("skip stale processed video clip %s, age %.1fs > %.1fs" % (clip_id, age, max_age))
 
     _download_url(msg["processed_video_url"], source_path)
     analysis = _analyze_video(source_path, annotated_path, annotated_frame_path)
@@ -291,6 +297,12 @@ def _run_openpose(source_path, width, height):
             "--model_pose", str(_config_value("OPENPOSE", "MODEL_POSE", "BODY_25")),
             "--number_people_max", str(int(_config_value("OPENPOSE", "NUMBER_PEOPLE_MAX", 10))),
         ]
+        frame_step = int(_config_value("OPENPOSE", "FRAME_STEP", 3))
+        if frame_step > 1:
+            cmd.extend(["--frame_step", str(frame_step)])
+        net_resolution = str(_config_value("OPENPOSE", "NET_RESOLUTION", "") or "").strip()
+        if net_resolution:
+            cmd.extend(["--net_resolution", net_resolution])
         model_folder = _openpose_model_folder(exe_path)
         if model_folder:
             cmd.extend(["--model_folder", str(model_folder)])
@@ -831,6 +843,26 @@ def _config_bool(section, key, default):
     if isinstance(value, bool):
         return value
     return str(value).strip().lower() in ("1", "true", "yes", "on")
+
+
+def _message_age_seconds(msg):
+    end_time = _parse_time(msg.get("end_time"))
+    if end_time is None:
+        return None
+    return max(0.0, (dt.datetime.now() - end_time).total_seconds())
+
+
+def _parse_time(value):
+    if not value:
+        return None
+    if isinstance(value, bytes):
+        value = value.decode("utf-8")
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"):
+        try:
+            return dt.datetime.strptime(str(value)[:19], fmt)
+        except ValueError:
+            pass
+    return None
 
 
 def _set_redis_status(monitor_id, status):

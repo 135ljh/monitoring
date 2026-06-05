@@ -45,7 +45,7 @@ DEFAULT_SENSOR_POINTS = [
     {"code": "temperature", "name": "\u6e29\u5ea6", "address": "D2021", "scale": 0.1, "unit": "\u2103", "min": 0.0, "max": 45.0},
     {"code": "noise", "name": "\u566a\u97f3", "address": "D2030", "scale": 0.1, "unit": "dB", "min": 0.0, "max": 85.0},
     {"code": "smoke", "name": "\u70df\u96fe", "address": "D2040", "scale": 1.0, "unit": "ppm", "min": 0.0, "max": 100.0},
-    {"code": "rope_displacement", "name": "\u62c9\u7ef3\u4f4d\u79fb", "address": "D2060", "scale": 0.1, "unit": "mm", "min": 0.0, "max": 1000.0},
+    {"code": "rope_displacement", "name": "\u62c9\u7ef3\u4f4d\u79fb", "address": "D2060", "scale": 0.1, "unit": "mm", "min": 0.0, "max": 50.0},
     {"code": "illuminance", "name": "\u5149\u7167\u5ea6", "address": "D2140", "scale": 1.0, "unit": "Lux", "min": 50.0, "max": 2000.0},
     {"code": "safety_grating", "name": "\u5b89\u5168\u5149\u6805", "address": "D2145", "scale": 1.0, "unit": "", "normal": 1},
 ]
