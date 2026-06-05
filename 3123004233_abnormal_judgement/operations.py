@@ -2,6 +2,7 @@
 # -*- coding: utf-8 -*-
 import datetime as dt
 import json
+import logging
 import os
 import time
 import threading
@@ -34,6 +35,9 @@ DEFAULT_SENSOR_PLC_IP = "10.21.2.233"
 DEFAULT_SENSOR_PLC_PORT = 502
 DEFAULT_SENSOR_PLC_TIMEOUT = 3.0
 DEFAULT_SENSOR_PLC_DEVICE_ID = 1
+DEFAULT_SENSOR_READ_DELAY_SECONDS = 0.05
+
+logging.getLogger("pymodbus").setLevel(logging.WARNING)
 
 DEFAULT_SENSOR_POINTS = [
     {"code": "voltage", "name": "\u7535\u538b", "address": "D2000", "scale": 0.1, "unit": "V", "min": 180.0, "max": 260.0},
@@ -207,21 +211,41 @@ def _read_sensor_registers(host, port, timeout, device_id, addresses):
 
 def _read_sensor_registers_single(host, port, timeout, device_id, addresses):
     values = {}
-    client = ModbusTcpClient(host=host, port=port, timeout=timeout)
+    delay = float(_config_value("SENSOR", "READ_DELAY_SECONDS", DEFAULT_SENSOR_READ_DELAY_SECONDS))
+    keep_alive = _config_bool("SENSOR", "KEEP_ALIVE", False)
+    client = None
     try:
-        if not client.connect():
-            raise RuntimeError("cannot connect sensor PLC %s:%s" % (host, port))
+        if keep_alive:
+            client = _open_modbus_client(host, port, timeout)
         for address in addresses:
-            response = client.read_holding_registers(address=address, count=1, device_id=device_id)
-            if isinstance(response, ModbusException):
-                raise RuntimeError("Modbus read failed at D%s: %s" % (address, response))
-            if response.isError():
-                error_code = getattr(response, "exception_code", response)
-                raise RuntimeError("PLC returned error at D%s: %s" % (address, error_code))
-            values[address] = response.registers[0]
+            read_client = None
+            try:
+                read_client = client or _open_modbus_client(host, port, timeout)
+                response = read_client.read_holding_registers(address=address, count=1, device_id=device_id)
+                if isinstance(response, ModbusException):
+                    raise RuntimeError("Modbus read failed at D%s: %s" % (address, response))
+                if response.isError():
+                    error_code = getattr(response, "exception_code", response)
+                    raise RuntimeError("PLC returned error at D%s: %s" % (address, error_code))
+                values[address] = response.registers[0]
+            except Exception as exc:
+                print("sensor read skipped D%s: %s" % (address, exc))
+            finally:
+                if read_client and not keep_alive:
+                    read_client.close()
+                if delay > 0:
+                    time.sleep(delay)
         return values
     finally:
-        client.close()
+        if client:
+            client.close()
+
+
+def _open_modbus_client(host, port, timeout):
+    client = ModbusTcpClient(host=host, port=port, timeout=timeout)
+    if not client.connect():
+        raise RuntimeError("cannot connect sensor PLC %s:%s" % (host, port))
+    return client
 
 
 def _read_sensor_registers_block(host, port, timeout, device_id, addresses):
