@@ -3,11 +3,14 @@
 import datetime as dt
 import json
 import os
+import time
 import threading
 import uuid
 
 import pymysql
 from kafka import KafkaConsumer, KafkaProducer
+from pymodbus.client import ModbusTcpClient
+from pymodbus.exceptions import ModbusException
 
 
 RECOGNITION_RESULT_TOPIC = "workshop.recognition_result"
@@ -24,6 +27,28 @@ DEFAULT_HELP_GESTURE_SECONDS = 2.0
 DEFAULT_FALL_NO_MOVEMENT_SECONDS = 10.0
 DEFAULT_CROWD_PERSON_THRESHOLD = 5
 DEFAULT_VIBRATION_DANGER_THRESHOLD = 0.006
+DEFAULT_SENSOR_POLL_INTERVAL = 2.0
+DEFAULT_SENSOR_PLC_IP = "10.21.2.233"
+DEFAULT_SENSOR_PLC_PORT = 502
+DEFAULT_SENSOR_PLC_TIMEOUT = 3.0
+DEFAULT_SENSOR_PLC_DEVICE_ID = 1
+
+DEFAULT_SENSOR_POINTS = [
+    {"code": "voltage", "name": "\u7535\u538b", "address": "D2000", "scale": 0.1, "unit": "V", "min": 180.0, "max": 260.0},
+    {"code": "current", "name": "\u7535\u6d41", "address": "D2001", "scale": 0.01, "unit": "A", "min": 0.0, "max": 20.0},
+    {"code": "active_power", "name": "\u77ac\u65f6\u6709\u529f\u529f\u7387", "address": "D2002", "scale": 1.0, "unit": "W", "min": 0.0, "max": 5000.0},
+    {"code": "power_factor", "name": "\u529f\u7387\u56e0\u6570", "address": "D2003", "scale": 0.001, "unit": "COS", "min": 0.8, "max": 1.0},
+    {"code": "frequency", "name": "\u9891\u7387", "address": "D2004", "scale": 0.01, "unit": "Hz", "min": 49.0, "max": 51.0},
+    {"code": "total_energy", "name": "\u603b\u6709\u529f\u7535\u80fd", "address": "D2005", "scale": 0.01, "unit": "kWh"},
+    {"code": "total_water", "name": "\u603b\u7528\u6c34\u91cf", "address": "D2010", "scale": 0.01, "unit": "m3"},
+    {"code": "humidity", "name": "\u6e7f\u5ea6", "address": "D2020", "scale": 0.1, "unit": "%RH", "min": 20.0, "max": 85.0},
+    {"code": "temperature", "name": "\u6e29\u5ea6", "address": "D2021", "scale": 0.1, "unit": "\u2103", "min": 0.0, "max": 45.0},
+    {"code": "noise", "name": "\u566a\u97f3", "address": "D2030", "scale": 1.0, "unit": "dB", "min": 0.0, "max": 85.0},
+    {"code": "smoke", "name": "\u70df\u96fe", "address": "D2040", "scale": 1.0, "unit": "ppm", "min": 0.0, "max": 100.0},
+    {"code": "rope_displacement", "name": "\u62c9\u7ef3\u4f4d\u79fb", "address": "D2060", "scale": 0.1, "unit": "mm", "min": 0.0, "max": 1000.0},
+    {"code": "illuminance", "name": "\u5149\u7167\u5ea6", "address": "D2140", "scale": 1.0, "unit": "Lux", "min": 50.0, "max": 2000.0},
+    {"code": "safety_grating", "name": "\u5b89\u5168\u5149\u6805", "address": "D2145", "scale": 1.0, "unit": "", "normal": 1},
+]
 
 _TASKS = {}
 _LOCK = threading.Lock()
@@ -54,6 +79,15 @@ def start_judge(data):
         thread = threading.Thread(target=_consume_loop, args=(task,), daemon=True, name="abnormal-judge-%s" % monitor_id)
         task["thread"] = thread
         thread.start()
+        if _config_bool("SENSOR", "ENABLED", True):
+            sensor_thread = threading.Thread(
+                target=_sensor_poll_loop,
+                args=(task,),
+                daemon=True,
+                name="sensor-monitor-%s" % monitor_id,
+            )
+            task["sensor_thread"] = sensor_thread
+            sensor_thread.start()
 
     _set_status(monitor_id, "running")
     return _response(monitor_id, output_topic, "running")
@@ -88,6 +122,240 @@ def _consume_loop(task):
             consumer.close()
         if producer:
             producer.close()
+
+
+def _sensor_poll_loop(task):
+    producer = None
+    try:
+        _init_mysql()
+        producer = _create_producer()
+        interval = float(_config_value("SENSOR", "POLL_INTERVAL_SECONDS", DEFAULT_SENSOR_POLL_INTERVAL))
+        while not task["stop_event"].is_set():
+            started = time.time()
+            try:
+                readings = _read_sensor_values()
+                if readings:
+                    _save_sensor_readings(task["monitor_id"], readings)
+                    events = _sensor_events(task["monitor_id"], readings)
+                    for event in events:
+                        _save_event(event)
+                        _save_sensor_abnormal(event)
+                        producer.send(task["output_topic"], event)
+                        producer.flush(timeout=10)
+                        print("published sensor abnormal event: %s" % json.dumps(event, ensure_ascii=False))
+            except Exception as exc:
+                print("sensor monitor failed: %s" % exc)
+            elapsed = time.time() - started
+            time.sleep(max(0.2, interval - elapsed))
+    except Exception as exc:
+        print("sensor monitor task failed: %s" % exc)
+    finally:
+        if producer:
+            producer.close()
+
+
+def _read_sensor_values():
+    points = _sensor_points()
+    if not points:
+        return []
+
+    host = _config_value("SENSOR", "PLC_IP", DEFAULT_SENSOR_PLC_IP)
+    port = int(_config_value("SENSOR", "PLC_PORT", DEFAULT_SENSOR_PLC_PORT))
+    timeout = float(_config_value("SENSOR", "PLC_TIMEOUT", DEFAULT_SENSOR_PLC_TIMEOUT))
+    device_id = int(_config_value("SENSOR", "PLC_DEVICE_ID", DEFAULT_SENSOR_PLC_DEVICE_ID))
+
+    addresses = sorted(set(_parse_plc_address(point["address"]) for point in points))
+    register_values = _read_sensor_registers(host, port, timeout, device_id, addresses)
+
+    now = _now_text()
+    readings = []
+    for point in points:
+        address = _parse_plc_address(point["address"])
+        raw = register_values.get(address)
+        if raw is None:
+            continue
+        signed = _to_signed_16(raw) if _sensor_bool(point, "signed", False) else int(raw)
+        value = round(signed * float(point.get("scale", 1.0)), 4)
+        status, reason = _sensor_status(point, value)
+        readings.append({
+            "panel_no": str(_config_value("SENSOR", "PANEL_NO", "4")),
+            "sensor_code": point.get("code"),
+            "sensor_name": point.get("name"),
+            "address": point.get("address"),
+            "raw_value": signed,
+            "value": value,
+            "unit": point.get("unit", ""),
+            "threshold_min": point.get("min"),
+            "threshold_max": point.get("max"),
+            "normal_value": point.get("normal"),
+            "status": status,
+            "abnormal_reason": reason,
+            "collected_at": now,
+        })
+    return readings
+
+
+def _read_sensor_registers(host, port, timeout, device_id, addresses):
+    if not addresses:
+        return {}
+    chunk_size = int(_config_value("SENSOR", "READ_CHUNK_SIZE", 20))
+    try:
+        values = {}
+        start = addresses[0]
+        end = addresses[0]
+        groups = []
+        for address in addresses[1:]:
+            if address == end + 1 and (address - start + 1) <= chunk_size:
+                end = address
+            else:
+                groups.append((start, end))
+                start = address
+                end = address
+        groups.append((start, end))
+        for start, end in groups:
+            values.update(_read_holding_register_block(host, port, timeout, device_id, start, end - start + 1))
+        return values
+    except Exception as exc:
+        print("sensor block read failed, fallback to single reads: %s" % exc)
+        values = {}
+        max_single_reads = int(_config_value("SENSOR", "MAX_SINGLE_READS_ON_FALLBACK", 5))
+        for address in addresses[:max_single_reads]:
+            try:
+                values.update(_read_holding_register_block(host, port, timeout, device_id, address, 1))
+            except Exception as item_exc:
+                print("sensor register D%s read failed: %s" % (address, item_exc))
+        if not values:
+            raise
+        return values
+
+
+def _read_holding_register_block(host, port, timeout, device_id, start, count):
+    client = ModbusTcpClient(host=host, port=port, timeout=timeout)
+    values = {}
+    try:
+        if not client.connect():
+            raise RuntimeError("cannot connect sensor PLC %s:%s" % (host, port))
+        remaining = count
+        offset = 0
+        chunk_size = int(_config_value("SENSOR", "READ_CHUNK_SIZE", 100))
+        while remaining > 0:
+            current = min(chunk_size, remaining)
+            response = client.read_holding_registers(address=start + offset, count=current, device_id=device_id)
+            if isinstance(response, ModbusException):
+                raise RuntimeError("Modbus read failed: %s" % response)
+            if response.isError():
+                error_code = getattr(response, "exception_code", response)
+                raise RuntimeError("PLC returned error: %s" % error_code)
+            for idx, value in enumerate(response.registers):
+                values[start + offset + idx] = value
+            offset += current
+            remaining -= current
+        return values
+    finally:
+        client.close()
+
+
+def _sensor_points():
+    configured = _config_value("SENSOR", "POINTS", None)
+    if isinstance(configured, list) and configured:
+        return configured
+    return DEFAULT_SENSOR_POINTS
+
+
+def _sensor_status(point, value):
+    normal = point.get("normal")
+    if normal is not None and value != float(normal):
+        return "abnormal", "%s=%s, expected %s" % (point.get("name"), value, normal)
+    min_value = point.get("min")
+    if min_value is not None and value < float(min_value):
+        return "abnormal", "%s %.4f%s below %.4f%s" % (
+            point.get("name"), value, point.get("unit", ""), float(min_value), point.get("unit", ""))
+    max_value = point.get("max")
+    if max_value is not None and value > float(max_value):
+        return "abnormal", "%s %.4f%s above %.4f%s" % (
+            point.get("name"), value, point.get("unit", ""), float(max_value), point.get("unit", ""))
+    return "normal", ""
+
+
+def _sensor_events(monitor_id, readings):
+    events = []
+    for reading in readings:
+        if reading.get("status") != "abnormal":
+            continue
+        if _sensor_in_cooldown(monitor_id, reading):
+            continue
+        level = _sensor_level(reading)
+        event = {
+            "monitor_id": monitor_id,
+            "event_id": "evt_%s" % uuid.uuid4().hex[:12],
+            "is_abnormal": True,
+            "abnormal_types": ["sensor_abnormal"],
+            "abnormal_level": level,
+            "event_description": _sensor_event_description(reading),
+            "evidence_video_url": None,
+            "evidence_frame_url": None,
+            "event_time": reading.get("collected_at") or _now_text(),
+            "camera_id": None,
+            "clip_id": None,
+            "sensor_data": reading,
+        }
+        events.append(event)
+        _set_key(_sensor_cooldown_key(monitor_id, reading), "1", int(_config_value("SENSOR", "COOLDOWN_SECONDS", 60)))
+    return events
+
+
+def _sensor_event_description(reading):
+    unit = reading.get("unit") or ""
+    parts = [
+        "\u4f20\u611f\u5668%s\u5f02\u5e38" % reading.get("sensor_name"),
+        "\u5730\u5740%s" % reading.get("address"),
+        "\u5f53\u524d\u503c%.4f%s" % (float(reading.get("value", 0.0)), unit),
+    ]
+    if reading.get("threshold_min") is not None:
+        parts.append("\u4e0b\u9650%.4f%s" % (float(reading.get("threshold_min")), unit))
+    if reading.get("threshold_max") is not None:
+        parts.append("\u4e0a\u9650%.4f%s" % (float(reading.get("threshold_max")), unit))
+    if reading.get("normal_value") is not None:
+        parts.append("\u6b63\u5e38\u503c%s" % reading.get("normal_value"))
+    return "\uff0c".join(parts)
+
+
+def _sensor_level(reading):
+    code = reading.get("sensor_code")
+    if code in ("smoke", "safety_grating"):
+        return "high"
+    if code in ("voltage", "current", "temperature"):
+        return "medium"
+    return "low"
+
+
+def _sensor_in_cooldown(monitor_id, reading):
+    return bool(_get_key(_sensor_cooldown_key(monitor_id, reading)))
+
+
+def _sensor_cooldown_key(monitor_id, reading):
+    return "monitor:%s:sensor:%s:cooldown" % (monitor_id, reading.get("sensor_code", "unknown"))
+
+
+def _parse_plc_address(address):
+    text = str(address or "").strip()
+    if text[:1].lower() == "d":
+        text = text[1:]
+    if not text.isdigit():
+        raise ValueError("invalid PLC address: %s" % address)
+    return int(text)
+
+
+def _to_signed_16(value):
+    value = int(value)
+    return value - 65536 if value >= 32768 else value
+
+
+def _sensor_bool(point, key, default):
+    value = point.get(key, default)
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in ("1", "true", "yes", "on")
 
 
 def _judge_message(msg):
@@ -307,6 +575,45 @@ def _init_mysql():
                     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
             """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS sensor_data_record (
+                    id BIGINT PRIMARY KEY AUTO_INCREMENT,
+                    monitor_id VARCHAR(128),
+                    panel_no VARCHAR(32),
+                    sensor_code VARCHAR(128),
+                    sensor_name VARCHAR(128),
+                    address VARCHAR(32),
+                    raw_value DOUBLE,
+                    value DOUBLE,
+                    unit VARCHAR(32),
+                    status VARCHAR(32),
+                    collected_at DATETIME,
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    INDEX idx_sensor_collected_at (sensor_code, collected_at),
+                    INDEX idx_monitor_collected_at (monitor_id, collected_at)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS sensor_abnormal_monitor (
+                    id BIGINT PRIMARY KEY AUTO_INCREMENT,
+                    monitor_id VARCHAR(128),
+                    event_id VARCHAR(128) UNIQUE,
+                    panel_no VARCHAR(32),
+                    sensor_code VARCHAR(128),
+                    sensor_name VARCHAR(128),
+                    address VARCHAR(32),
+                    value DOUBLE,
+                    unit VARCHAR(32),
+                    threshold_min DOUBLE NULL,
+                    threshold_max DOUBLE NULL,
+                    normal_value VARCHAR(64),
+                    abnormal_reason TEXT,
+                    abnormal_level VARCHAR(32),
+                    collected_at DATETIME,
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    INDEX idx_sensor_abnormal_collected_at (sensor_code, collected_at)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            """)
         conn.commit()
     finally:
         conn.close()
@@ -339,6 +646,79 @@ def _save_event(event):
         conn.commit()
     except Exception as exc:
         print("save abnormal event failed: %s" % exc)
+    finally:
+        conn.close()
+
+
+def _save_sensor_readings(monitor_id, readings):
+    conn = _mysql_conn()
+    if not conn:
+        return
+    try:
+        with conn.cursor() as cur:
+            rows = []
+            for item in readings:
+                rows.append((
+                    monitor_id,
+                    item.get("panel_no"),
+                    item.get("sensor_code"),
+                    item.get("sensor_name"),
+                    item.get("address"),
+                    item.get("raw_value"),
+                    item.get("value"),
+                    item.get("unit"),
+                    item.get("status"),
+                    item.get("collected_at"),
+                ))
+            if rows:
+                cur.executemany("""
+                    INSERT INTO sensor_data_record (
+                        monitor_id, panel_no, sensor_code, sensor_name, address,
+                        raw_value, value, unit, status, collected_at
+                    ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                """, rows)
+        conn.commit()
+    except Exception as exc:
+        print("save sensor readings failed: %s" % exc)
+    finally:
+        conn.close()
+
+
+def _save_sensor_abnormal(event):
+    sensor = event.get("sensor_data") or {}
+    if not sensor:
+        return
+    conn = _mysql_conn()
+    if not conn:
+        return
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO sensor_abnormal_monitor (
+                    monitor_id, event_id, panel_no, sensor_code, sensor_name, address,
+                    value, unit, threshold_min, threshold_max, normal_value,
+                    abnormal_reason, abnormal_level, collected_at
+                ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                ON DUPLICATE KEY UPDATE abnormal_reason=VALUES(abnormal_reason)
+            """, (
+                event.get("monitor_id"),
+                event.get("event_id"),
+                sensor.get("panel_no"),
+                sensor.get("sensor_code"),
+                sensor.get("sensor_name"),
+                sensor.get("address"),
+                sensor.get("value"),
+                sensor.get("unit"),
+                sensor.get("threshold_min"),
+                sensor.get("threshold_max"),
+                sensor.get("normal_value"),
+                sensor.get("abnormal_reason"),
+                event.get("abnormal_level"),
+                sensor.get("collected_at"),
+            ))
+        conn.commit()
+    except Exception as exc:
+        print("save sensor abnormal failed: %s" % exc)
     finally:
         conn.close()
 
@@ -483,6 +863,13 @@ def _config_value(section, key, default=None):
     if isinstance(section_cfg, dict) and section_cfg.get(key) is not None:
         return section_cfg.get(key)
     return cfg.get(key, default) if isinstance(cfg, dict) else default
+
+
+def _config_bool(section, key, default):
+    value = _config_value(section, key, default)
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in ("1", "true", "yes", "on")
 
 
 def _update_task(monitor_id, **kwargs):

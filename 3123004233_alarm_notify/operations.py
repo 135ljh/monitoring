@@ -475,6 +475,7 @@ def _type_name(item):
         "person_running": "\u4eba\u5458\u5feb\u901f\u5954\u8dd1\u6216\u5f02\u5e38\u79fb\u52a8",
         "help_gesture": "\u4eba\u5458\u6325\u624b\u6c42\u52a9\u6216\u5f02\u5e38\u6325\u52a8",
         "fall_no_movement": "\u4eba\u5458\u5012\u5730\u540e\u65e0\u52a8\u4f5c",
+        "sensor_abnormal": "\u4f20\u611f\u5668\u6570\u636e\u5f02\u5e38",
         "device_vibration": "\u8bbe\u5907\u5f02\u5e38\u9707\u52a8",
         "device_stop": "\u8bbe\u5907\u5f02\u5e38\u505c\u673a",
         "unknown_abnormal": "\u672a\u77e5\u5f02\u5e38",
