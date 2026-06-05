@@ -2,6 +2,7 @@
 # -*- coding: utf-8 -*-
 import json
 import os
+import subprocess
 import tempfile
 import threading
 import uuid
@@ -18,6 +19,23 @@ from minio import Minio
 PROCESSED_VIDEO_TOPIC = "workshop.processed_video"
 RECOGNITION_RESULT_TOPIC = "workshop.recognition_result"
 DEFAULT_GROUP = "workshop-behavior-recognition"
+BODY_25 = {
+    "nose": 0,
+    "neck": 1,
+    "right_shoulder": 2,
+    "right_elbow": 3,
+    "right_wrist": 4,
+    "left_shoulder": 5,
+    "left_elbow": 6,
+    "left_wrist": 7,
+    "mid_hip": 8,
+    "right_hip": 9,
+    "right_knee": 10,
+    "right_ankle": 11,
+    "left_hip": 12,
+    "left_knee": 13,
+    "left_ankle": 14,
+}
 
 _TASKS = {}
 _LOCK = threading.Lock()
@@ -194,8 +212,39 @@ def _analyze_video(source_path, annotated_path, annotated_frame_path):
     action_type = "static" if movement_score < float(_config_value("RECOGNITION", "STATIC_MOTION_THRESHOLD", 0.018)) else "moving"
     vibration_level = _vibration_level(vibration_score)
 
-    person_results = []
     deduped_boxes = _dedupe_boxes(person_boxes)
+    openpose_tracks = _run_openpose(source_path, width, height)
+    if openpose_tracks:
+        person_results = _openpose_person_results(openpose_tracks, width, height, movement_score, action_type)
+        person_count = max((track.get("max_people", 1) for track in openpose_tracks), default=len(person_results))
+        pose_backend = "openpose"
+    else:
+        person_results = _fallback_person_results(
+            deduped_boxes, sampled_person_boxes, width, height, movement_score, upper_motion_score, action_type)
+        person_count = len(deduped_boxes)
+        pose_backend = "opencv_hog"
+
+    device_results = [{
+        "device_id": _config_value("RECOGNITION", "DEVICE_ID", "DEV_001"),
+        "roi": {"x": device_roi[0], "y": device_roi[1], "w": device_roi[2], "h": device_roi[3]},
+        "vibration_score": vibration_score,
+        "vibration_level": vibration_level,
+        "optical_flow_value": round(vibration_score * 100.0, 4),
+    }]
+
+    scene_result = {
+        "person_count": person_count,
+        "crowd_count": person_count,
+        "movement_score": movement_score,
+        "upper_motion_score": upper_motion_score,
+        "pose_backend": pose_backend,
+    }
+
+    return {"person_results": person_results, "device_results": device_results, "scene_result": scene_result}
+
+
+def _fallback_person_results(deduped_boxes, sampled_person_boxes, width, height, movement_score, upper_motion_score, action_type):
+    person_results = []
     center_speed = _person_center_speed(sampled_person_boxes, width, height)
     for idx, box in enumerate(deduped_boxes[:10] or [[0, 0, width, height]]):
         x, y, w, h = box
@@ -214,25 +263,333 @@ def _analyze_video(source_path, annotated_path, annotated_frame_path):
             "fall_suspected": fall_suspected,
             "running_suspected": running_suspected,
             "help_gesture_suspected": help_suspected,
-            "confidence": 0.65 if person_boxes else 0.35,
+            "confidence": 0.65 if deduped_boxes else 0.35,
         })
+    return person_results
 
-    device_results = [{
-        "device_id": _config_value("RECOGNITION", "DEVICE_ID", "DEV_001"),
-        "roi": {"x": device_roi[0], "y": device_roi[1], "w": device_roi[2], "h": device_roi[3]},
-        "vibration_score": vibration_score,
-        "vibration_level": vibration_level,
-        "optical_flow_value": round(vibration_score * 100.0, 4),
-    }]
 
-    scene_result = {
-        "person_count": len(deduped_boxes),
-        "crowd_count": len(deduped_boxes),
-        "movement_score": movement_score,
-        "upper_motion_score": upper_motion_score,
-    }
+def _run_openpose(source_path, width, height):
+    if not _config_bool("OPENPOSE", "ENABLED", False):
+        return []
 
-    return {"person_results": person_results, "device_results": device_results, "scene_result": scene_result}
+    exe_path = _openpose_exe_path()
+    if not exe_path or not exe_path.exists():
+        message = "OpenPose executable not found: %s" % (exe_path or "")
+        if _config_bool("OPENPOSE", "REQUIRE_OPENPOSE", False):
+            raise RuntimeError(message)
+        print(message)
+        return []
+
+    json_dir = Path(tempfile.mkdtemp(prefix="openpose_json_"))
+    try:
+        cmd = [
+            str(exe_path),
+            "--video", str(source_path),
+            "--write_json", str(json_dir),
+            "--display", "0",
+            "--render_pose", "0",
+            "--model_pose", str(_config_value("OPENPOSE", "MODEL_POSE", "BODY_25")),
+            "--number_people_max", str(int(_config_value("OPENPOSE", "NUMBER_PEOPLE_MAX", 10))),
+        ]
+        model_folder = _openpose_model_folder(exe_path)
+        if model_folder:
+            cmd.extend(["--model_folder", str(model_folder)])
+
+        timeout = int(_config_value("OPENPOSE", "TIMEOUT_SECONDS", 180))
+        completed = subprocess.run(
+            cmd,
+            cwd=str(_openpose_root(exe_path)),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=timeout,
+        )
+        if completed.returncode != 0:
+            detail = (completed.stderr or completed.stdout or "")[-1000:]
+            if _config_bool("OPENPOSE", "REQUIRE_OPENPOSE", False):
+                raise RuntimeError("OpenPose failed: %s" % detail)
+            print("OpenPose failed: %s" % detail)
+            return []
+
+        return _parse_openpose_json(json_dir, width, height)
+    except subprocess.TimeoutExpired:
+        if _config_bool("OPENPOSE", "REQUIRE_OPENPOSE", False):
+            raise
+        print("OpenPose timed out for %s" % source_path)
+        return []
+    finally:
+        _remove_tree(json_dir)
+
+
+def _openpose_exe_path():
+    configured = _config_value("OPENPOSE", "EXE_PATH", os.getenv("OPENPOSE_EXE_PATH"))
+    if configured:
+        return Path(str(configured))
+
+    root = _config_value("OPENPOSE", "ROOT", os.getenv("OPENPOSE_ROOT"))
+    if root:
+        root_path = Path(str(root))
+        candidates = [
+            root_path / "bin" / "OpenPoseDemo.exe",
+            root_path / "bin" / "openpose.exe",
+            root_path / "build" / "x64" / "Release" / "OpenPoseDemo.exe",
+            root_path / "OpenPoseDemo.exe",
+        ]
+        for item in candidates:
+            if item.exists():
+                return item
+    return None
+
+
+def _openpose_root(exe_path):
+    root = _config_value("OPENPOSE", "ROOT", os.getenv("OPENPOSE_ROOT"))
+    if root:
+        return Path(str(root))
+    if exe_path.parent.name.lower() == "bin":
+        return exe_path.parent.parent
+    return exe_path.parent
+
+
+def _openpose_model_folder(exe_path):
+    configured = _config_value("OPENPOSE", "MODEL_FOLDER", os.getenv("OPENPOSE_MODEL_FOLDER"))
+    if configured:
+        return Path(str(configured))
+    root = _openpose_root(exe_path)
+    candidate = root / "models"
+    return candidate if candidate.exists() else None
+
+
+def _parse_openpose_json(json_dir, width, height):
+    tracks = []
+    max_people = 0
+    for json_file in sorted(json_dir.glob("*_keypoints.json")):
+        with open(json_file, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        people = data.get("people", []) or []
+        max_people = max(max_people, len(people))
+        people = sorted(people, key=_openpose_person_score, reverse=True)
+        for idx, person in enumerate(people[:int(_config_value("OPENPOSE", "NUMBER_PEOPLE_MAX", 10))]):
+            while len(tracks) <= idx:
+                tracks.append({"frames": [], "max_people": max_people})
+            keypoints = _openpose_keypoints(person)
+            if keypoints is not None:
+                tracks[idx]["frames"].append(keypoints)
+                tracks[idx]["max_people"] = max(tracks[idx].get("max_people", 0), max_people)
+
+    min_frames = int(_config_value("OPENPOSE", "MIN_VALID_FRAMES", 2))
+    return [track for track in tracks if len(track.get("frames", [])) >= min_frames]
+
+
+def _openpose_person_score(person):
+    keypoints = _openpose_keypoints(person)
+    if keypoints is None:
+        return 0.0
+    valid = keypoints[:, 2] > float(_config_value("OPENPOSE", "KEYPOINT_CONFIDENCE", 0.05))
+    if not np.any(valid):
+        return 0.0
+    xs = keypoints[valid, 0]
+    ys = keypoints[valid, 1]
+    area = max(1.0, float((xs.max() - xs.min()) * (ys.max() - ys.min())))
+    return area * float(np.mean(keypoints[valid, 2]))
+
+
+def _openpose_keypoints(person):
+    values = person.get("pose_keypoints_2d")
+    if not values:
+        return None
+    arr = np.array(values, dtype=float).reshape((-1, 3))
+    if arr.shape[0] < 15:
+        return None
+    return arr
+
+
+def _openpose_person_results(tracks, width, height, movement_score, action_type):
+    results = []
+    for idx, track in enumerate(tracks[:int(_config_value("OPENPOSE", "NUMBER_PEOPLE_MAX", 10))]):
+        frames = track.get("frames", [])
+        latest = frames[-1]
+        bbox = _keypoint_bbox(latest, width, height)
+        center_speed = _keypoint_center_speed(frames, width, height)
+        posture_type, posture_score = _posture_from_keypoints(frames, width, height)
+        fall_suspected = _fall_from_keypoints(frames, width, height)
+        help_suspected = _help_from_keypoints(frames, height)
+        running_suspected = center_speed >= float(_config_value("RECOGNITION", "RUNNING_SPEED_THRESHOLD", 0.22))
+        results.append({
+            "person_id": "P%03d" % (idx + 1),
+            "bbox": bbox,
+            "action_type": action_type,
+            "movement_score": movement_score,
+            "center_speed": round(center_speed, 4),
+            "posture_type": posture_type,
+            "posture_score": round(posture_score, 4),
+            "fall_suspected": fall_suspected,
+            "running_suspected": running_suspected,
+            "help_gesture_suspected": help_suspected,
+            "keypoint_format": "BODY_25",
+            "keypoint_backend": "openpose",
+            "confidence": round(_mean_keypoint_confidence(latest), 4),
+        })
+    return results
+
+
+def _keypoint_bbox(keypoints, width, height):
+    valid = keypoints[:, 2] > float(_config_value("OPENPOSE", "KEYPOINT_CONFIDENCE", 0.05))
+    if not np.any(valid):
+        return [0, 0, width, height]
+    xs = keypoints[valid, 0]
+    ys = keypoints[valid, 1]
+    return [
+        int(max(0, np.min(xs))),
+        int(max(0, np.min(ys))),
+        int(min(width, np.max(xs))),
+        int(min(height, np.max(ys))),
+    ]
+
+
+def _keypoint_center_speed(frames, width, height):
+    centers = []
+    for keypoints in frames:
+        center = _person_center_from_keypoints(keypoints)
+        if center is not None:
+            centers.append((center[0] / max(1, width), center[1] / max(1, height)))
+    if len(centers) < 2:
+        return 0.0
+    distances = []
+    for idx in range(1, len(centers)):
+        dx = centers[idx][0] - centers[idx - 1][0]
+        dy = centers[idx][1] - centers[idx - 1][1]
+        distances.append(float(np.sqrt(dx * dx + dy * dy)))
+    return float(np.mean(distances)) if distances else 0.0
+
+
+def _person_center_from_keypoints(keypoints):
+    points = []
+    for name in ("neck", "mid_hip", "left_hip", "right_hip"):
+        point = _point(keypoints, name)
+        if point is not None:
+            points.append(point)
+    if not points:
+        return None
+    arr = np.array(points, dtype=float)
+    return float(np.mean(arr[:, 0])), float(np.mean(arr[:, 1]))
+
+
+def _posture_from_keypoints(frames, width, height):
+    keypoints = frames[-1]
+    torso_angle = _torso_angle_from_horizontal(keypoints)
+    knee_angle = _min_knee_angle(keypoints)
+    shoulder_y = _avg_y(keypoints, ("left_shoulder", "right_shoulder", "neck"))
+    hip_y = _avg_y(keypoints, ("left_hip", "right_hip", "mid_hip"))
+    if torso_angle is not None and torso_angle <= float(_config_value("OPENPOSE", "FALL_TORSO_ANGLE", 35)):
+        return "horizontal", 1.0 - torso_angle / 90.0
+    if knee_angle is not None and knee_angle <= float(_config_value("OPENPOSE", "SQUAT_KNEE_ANGLE", 95)):
+        return "squat", 1.0 - knee_angle / 180.0
+    if shoulder_y is not None and hip_y is not None and abs(shoulder_y - hip_y) <= height * float(_config_value("OPENPOSE", "BEND_SHOULDER_HIP_DELTA_RATIO", 0.18)):
+        return "bend", 1.0 - abs(shoulder_y - hip_y) / max(1.0, height)
+    if torso_angle is not None and torso_angle <= float(_config_value("OPENPOSE", "BEND_TORSO_ANGLE", 60)):
+        return "bend", 1.0 - torso_angle / 90.0
+    return "standing", 0.0
+
+
+def _fall_from_keypoints(frames, width, height):
+    keypoints = frames[-1]
+    torso_angle = _torso_angle_from_horizontal(keypoints)
+    head = _point(keypoints, "nose") or _point(keypoints, "neck")
+    hip = _point(keypoints, "mid_hip")
+    if torso_angle is None or head is None:
+        return False
+    head_low = head[1] >= height * float(_config_value("OPENPOSE", "FALL_HEAD_LOW_RATIO", 0.45))
+    hip_low = hip is not None and hip[1] >= height * float(_config_value("OPENPOSE", "FALL_HIP_LOW_RATIO", 0.50))
+    return torso_angle <= float(_config_value("OPENPOSE", "FALL_TORSO_ANGLE", 35)) and (head_low or hip_low)
+
+
+def _help_from_keypoints(frames, height):
+    raised_frames = 0
+    wrist_y_values = []
+    for keypoints in frames:
+        shoulder_y = _avg_y(keypoints, ("left_shoulder", "right_shoulder"))
+        if shoulder_y is None:
+            continue
+        raised = False
+        for wrist_name in ("left_wrist", "right_wrist"):
+            wrist = _point(keypoints, wrist_name)
+            if wrist is not None:
+                wrist_y_values.append(wrist[1])
+                if wrist[1] < shoulder_y:
+                    raised = True
+        if raised:
+            raised_frames += 1
+    if raised_frames < int(_config_value("OPENPOSE", "HELP_MIN_RAISED_FRAMES", 2)):
+        return False
+    if len(wrist_y_values) < 2:
+        return True
+    amplitude = max(wrist_y_values) - min(wrist_y_values)
+    return amplitude >= height * float(_config_value("OPENPOSE", "HELP_WRIST_AMPLITUDE_RATIO", 0.08))
+
+
+def _torso_angle_from_horizontal(keypoints):
+    neck = _point(keypoints, "neck")
+    hip = _point(keypoints, "mid_hip") or _avg_point(keypoints, ("left_hip", "right_hip"))
+    if neck is None or hip is None:
+        return None
+    dx = abs(neck[0] - hip[0])
+    dy = abs(neck[1] - hip[1])
+    return float(np.degrees(np.arctan2(dy, max(dx, 1e-6))))
+
+
+def _min_knee_angle(keypoints):
+    angles = []
+    for side in ("left", "right"):
+        hip = _point(keypoints, "%s_hip" % side)
+        knee = _point(keypoints, "%s_knee" % side)
+        ankle = _point(keypoints, "%s_ankle" % side)
+        angle = _angle(hip, knee, ankle)
+        if angle is not None:
+            angles.append(angle)
+    return min(angles) if angles else None
+
+
+def _angle(a, b, c):
+    if a is None or b is None or c is None:
+        return None
+    ba = np.array([a[0] - b[0], a[1] - b[1]], dtype=float)
+    bc = np.array([c[0] - b[0], c[1] - b[1]], dtype=float)
+    denom = float(np.linalg.norm(ba) * np.linalg.norm(bc))
+    if denom <= 1e-6:
+        return None
+    cosine = float(np.clip(np.dot(ba, bc) / denom, -1.0, 1.0))
+    return float(np.degrees(np.arccos(cosine)))
+
+
+def _point(keypoints, name):
+    idx = BODY_25.get(name)
+    if idx is None or idx >= len(keypoints):
+        return None
+    x, y, conf = keypoints[idx]
+    if conf < float(_config_value("OPENPOSE", "KEYPOINT_CONFIDENCE", 0.05)):
+        return None
+    return float(x), float(y)
+
+
+def _avg_point(keypoints, names):
+    points = [_point(keypoints, name) for name in names]
+    points = [point for point in points if point is not None]
+    if not points:
+        return None
+    arr = np.array(points, dtype=float)
+    return float(np.mean(arr[:, 0])), float(np.mean(arr[:, 1]))
+
+
+def _avg_y(keypoints, names):
+    point = _avg_point(keypoints, names)
+    return point[1] if point is not None else None
+
+
+def _mean_keypoint_confidence(keypoints):
+    valid = keypoints[:, 2] > float(_config_value("OPENPOSE", "KEYPOINT_CONFIDENCE", 0.05))
+    if not np.any(valid):
+        return 0.0
+    return float(np.mean(keypoints[valid, 2]))
 
 
 def _person_center_speed(sampled_boxes, width, height):
@@ -428,6 +785,13 @@ def _config_value(section, key, default=None):
     return cfg.get(key, default) if isinstance(cfg, dict) else default
 
 
+def _config_bool(section, key, default):
+    value = _config_value(section, key, default)
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in ("1", "true", "yes", "on")
+
+
 def _set_redis_status(monitor_id, status):
     try:
         import functions
@@ -452,5 +816,20 @@ def _response(monitor_id, topic, status):
 def _safe_unlink(path):
     try:
         Path(path).unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
+def _remove_tree(path):
+    path = Path(path)
+    if not path.exists():
+        return
+    for child in path.iterdir():
+        if child.is_dir():
+            _remove_tree(child)
+        else:
+            _safe_unlink(child)
+    try:
+        path.rmdir()
     except Exception:
         pass
