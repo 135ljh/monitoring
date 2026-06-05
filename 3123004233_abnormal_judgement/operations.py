@@ -403,6 +403,9 @@ def _judge_message(msg):
 
     for person in msg.get("person_results", []):
         person_id = person.get("person_id", "unknown")
+        if not _valid_person_for_judge(person):
+            _delete_all_person_conditions(monitor_id, person_id)
+            continue
         _judge_person_static(monitor_id, msg, person, person_id, abnormal_types, descriptions)
         _judge_person_fall(monitor_id, msg, person, person_id, abnormal_types, descriptions)
         _judge_abnormal_posture(monitor_id, msg, person, person_id, abnormal_types, descriptions)
@@ -457,6 +460,9 @@ def _judge_person_fall(monitor_id, msg, person, person_id, abnormal_types, descr
 
 def _judge_abnormal_posture(monitor_id, msg, person, person_id, abnormal_types, descriptions):
     condition = "person:%s:abnormal_posture" % person_id
+    if not _config_bool("JUDGE", "ENABLE_ABNORMAL_POSTURE_RULE", False):
+        _delete_condition(monitor_id, condition)
+        return
     posture_type = person.get("posture_type")
     if posture_type not in ("bend", "squat"):
         _delete_condition(monitor_id, condition)
@@ -470,7 +476,11 @@ def _judge_abnormal_posture(monitor_id, msg, person, person_id, abnormal_types, 
 
 def _judge_person_running(monitor_id, msg, person, person_id, abnormal_types, descriptions):
     condition = "person:%s:running" % person_id
-    if not person.get("running_suspected"):
+    if not _config_bool("JUDGE", "ENABLE_RUNNING_RULE", False):
+        _delete_condition(monitor_id, condition)
+        return
+    min_motion = float(_config_value("JUDGE", "RUNNING_MIN_MOTION_SCORE", 0.035))
+    if not person.get("running_suspected") or float(person.get("movement_score", 0.0) or 0.0) < min_motion:
         _delete_condition(monitor_id, condition)
         return
     duration = _accumulate_condition_duration(monitor_id, condition, msg)
@@ -516,6 +526,9 @@ def _judge_person_absent(monitor_id, msg, scene, abnormal_types, descriptions):
 
 def _judge_crowd_gathering(monitor_id, msg, scene, abnormal_types, descriptions):
     condition = "scene:crowd_gathering"
+    if not _config_bool("JUDGE", "ENABLE_CROWD_RULE", False):
+        _delete_condition(monitor_id, condition)
+        return
     person_count = int(scene.get("crowd_count", scene.get("person_count", 0)) or 0)
     threshold = int(_config_value("JUDGE", "CROWD_PERSON_THRESHOLD", DEFAULT_CROWD_PERSON_THRESHOLD))
     if person_count <= threshold:
@@ -538,6 +551,25 @@ def _judge_device_vibration(monitor_id, msg, abnormal_types, descriptions):
             abnormal_types.append("device_vibration")
             descriptions.append("\u8bbe\u5907%s\u5b58\u5728\u5f02\u5e38\u9707\u52a8\uff0c\u9707\u52a8\u5206\u6570%.4f" % (
                 device_id, vibration_score))
+
+
+def _valid_person_for_judge(person):
+    confidence = float(person.get("confidence", 0.0) or 0.0)
+    min_confidence = float(_config_value("JUDGE", "MIN_PERSON_CONFIDENCE", 0.35))
+    if confidence < min_confidence:
+        return False
+    bbox = person.get("bbox") or []
+    if len(bbox) == 4:
+        width = max(0, float(bbox[2]) - float(bbox[0]))
+        height = max(0, float(bbox[3]) - float(bbox[1]))
+        if width * height < float(_config_value("JUDGE", "MIN_PERSON_BBOX_AREA", 8000)):
+            return False
+    return True
+
+
+def _delete_all_person_conditions(monitor_id, person_id):
+    for suffix in ("static", "fall", "abnormal_posture", "running", "help_gesture", "fall_no_movement"):
+        _delete_condition(monitor_id, "person:%s:%s" % (person_id, suffix))
 
 
 def _accumulate_static_duration(monitor_id, person_id, msg):

@@ -216,7 +216,7 @@ def _analyze_video(source_path, annotated_path, annotated_frame_path):
     openpose_tracks = _run_openpose(source_path, width, height)
     if openpose_tracks:
         person_results = _openpose_person_results(openpose_tracks, width, height, movement_score, action_type)
-        person_count = max((track.get("max_people", 1) for track in openpose_tracks), default=len(person_results))
+        person_count = len(person_results)
         pose_backend = "openpose"
     else:
         person_results = _fallback_person_results(
@@ -361,23 +361,23 @@ def _openpose_model_folder(exe_path):
 
 def _parse_openpose_json(json_dir, width, height):
     tracks = []
-    max_people = 0
     for json_file in sorted(json_dir.glob("*_keypoints.json")):
         with open(json_file, "r", encoding="utf-8") as fh:
             data = json.load(fh)
         people = data.get("people", []) or []
-        max_people = max(max_people, len(people))
         people = sorted(people, key=_openpose_person_score, reverse=True)
         for idx, person in enumerate(people[:int(_config_value("OPENPOSE", "NUMBER_PEOPLE_MAX", 10))]):
             while len(tracks) <= idx:
-                tracks.append({"frames": [], "max_people": max_people})
+                tracks.append({"frames": []})
             keypoints = _openpose_keypoints(person)
             if keypoints is not None:
                 tracks[idx]["frames"].append(keypoints)
-                tracks[idx]["max_people"] = max(tracks[idx].get("max_people", 0), max_people)
 
     min_frames = int(_config_value("OPENPOSE", "MIN_VALID_FRAMES", 2))
-    return [track for track in tracks if len(track.get("frames", [])) >= min_frames]
+    return [
+        track for track in tracks
+        if len(track.get("frames", [])) >= min_frames and _valid_openpose_track(track, width, height)
+    ]
 
 
 def _openpose_person_score(person):
@@ -427,9 +427,34 @@ def _openpose_person_results(tracks, width, height, movement_score, action_type)
             "help_gesture_suspected": help_suspected,
             "keypoint_format": "BODY_25",
             "keypoint_backend": "openpose",
+            "valid_keypoint_count": _valid_keypoint_count(latest),
+            "track_frame_count": len(frames),
             "confidence": round(_mean_keypoint_confidence(latest), 4),
         })
     return results
+
+
+def _valid_openpose_track(track, width, height):
+    frames = track.get("frames", [])
+    if not frames:
+        return False
+    latest = frames[-1]
+    confidence = _mean_keypoint_confidence(latest)
+    valid_count = _valid_keypoint_count(latest)
+    x1, y1, x2, y2 = _keypoint_bbox(latest, width, height)
+    bbox_w = max(0, x2 - x1)
+    bbox_h = max(0, y2 - y1)
+    area_ratio = (bbox_w * bbox_h) / float(max(1, width * height))
+    height_ratio = bbox_h / float(max(1, height))
+    min_conf = float(_config_value("OPENPOSE", "MIN_PERSON_CONFIDENCE", 0.35))
+    min_points = int(_config_value("OPENPOSE", "MIN_VALID_KEYPOINTS", 6))
+    min_area = float(_config_value("OPENPOSE", "MIN_BBOX_AREA_RATIO", 0.02))
+    min_height = float(_config_value("OPENPOSE", "MIN_BBOX_HEIGHT_RATIO", 0.18))
+    if confidence < min_conf or valid_count < min_points:
+        return False
+    if area_ratio < min_area or height_ratio < min_height:
+        return False
+    return _has_core_body_keypoints(latest)
 
 
 def _keypoint_bbox(keypoints, width, height):
@@ -444,6 +469,22 @@ def _keypoint_bbox(keypoints, width, height):
         int(min(width, np.max(xs))),
         int(min(height, np.max(ys))),
     ]
+
+
+def _valid_keypoint_count(keypoints):
+    return int(np.sum(keypoints[:, 2] > float(_config_value("OPENPOSE", "KEYPOINT_CONFIDENCE", 0.05))))
+
+
+def _has_core_body_keypoints(keypoints):
+    core_groups = [
+        ("neck",),
+        ("left_shoulder", "right_shoulder"),
+        ("mid_hip", "left_hip", "right_hip"),
+    ]
+    for names in core_groups:
+        if not any(_point(keypoints, name) is not None for name in names):
+            return False
+    return True
 
 
 def _keypoint_center_speed(frames, width, height):
