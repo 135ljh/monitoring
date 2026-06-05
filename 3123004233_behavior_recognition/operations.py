@@ -251,9 +251,15 @@ def _analyze_video(source_path, annotated_path, annotated_frame_path):
 
 def _fallback_person_results(deduped_boxes, sampled_person_boxes, width, height, movement_score, upper_motion_score, action_type):
     person_results = []
+    if not deduped_boxes:
+        return person_results
     center_speed = _person_center_speed(sampled_person_boxes, width, height)
-    for idx, box in enumerate(deduped_boxes[:10] or [[0, 0, width, height]]):
+    min_area = float(_config_value("RECOGNITION", "MIN_HOG_BBOX_AREA_RATIO", 0.04)) * float(width * height)
+    min_height = float(_config_value("RECOGNITION", "MIN_HOG_BBOX_HEIGHT_RATIO", 0.25)) * float(height)
+    for idx, box in enumerate(deduped_boxes[:5]):
         x, y, w, h = box
+        if w * h < min_area or h < min_height:
+            continue
         posture_type, posture_score = _posture_from_box(box, width, height)
         fall_suspected = _fall_suspected(box, width, height, posture_type, bool(deduped_boxes))
         running_suspected = center_speed >= float(_config_value("RECOGNITION", "RUNNING_SPEED_THRESHOLD", 0.22))
@@ -269,7 +275,7 @@ def _fallback_person_results(deduped_boxes, sampled_person_boxes, width, height,
             "fall_suspected": fall_suspected,
             "running_suspected": running_suspected,
             "help_gesture_suspected": help_suspected,
-            "confidence": 0.65 if deduped_boxes else 0.35,
+            "confidence": 0.65,
         })
     return person_results
 
@@ -458,10 +464,10 @@ def _valid_openpose_track(track, width, height):
     bbox_h = max(0, y2 - y1)
     area_ratio = (bbox_w * bbox_h) / float(max(1, width * height))
     height_ratio = bbox_h / float(max(1, height))
-    min_conf = float(_config_value("OPENPOSE", "MIN_PERSON_CONFIDENCE", 0.35))
-    min_points = int(_config_value("OPENPOSE", "MIN_VALID_KEYPOINTS", 6))
-    min_area = float(_config_value("OPENPOSE", "MIN_BBOX_AREA_RATIO", 0.02))
-    min_height = float(_config_value("OPENPOSE", "MIN_BBOX_HEIGHT_RATIO", 0.18))
+    min_conf = float(_config_value("OPENPOSE", "MIN_PERSON_CONFIDENCE", 0.55))
+    min_points = int(_config_value("OPENPOSE", "MIN_VALID_KEYPOINTS", 8))
+    min_area = float(_config_value("OPENPOSE", "MIN_BBOX_AREA_RATIO", 0.05))
+    min_height = float(_config_value("OPENPOSE", "MIN_BBOX_HEIGHT_RATIO", 0.35))
     if confidence < min_conf or valid_count < min_points:
         return False
     if area_ratio < min_area or height_ratio < min_height:

@@ -438,6 +438,9 @@ def _judge_message(msg):
 
 def _judge_person_static(monitor_id, msg, person, person_id, abnormal_types, descriptions):
     condition = "person:%s:static" % person_id
+    if not _config_bool("JUDGE", "ENABLE_STATIC_RULE", True):
+        _delete_condition(monitor_id, condition)
+        return
     if person.get("action_type") != "static":
         _delete_condition(monitor_id, condition)
         return
@@ -555,14 +558,19 @@ def _judge_device_vibration(monitor_id, msg, abnormal_types, descriptions):
 
 def _valid_person_for_judge(person):
     confidence = float(person.get("confidence", 0.0) or 0.0)
-    min_confidence = float(_config_value("JUDGE", "MIN_PERSON_CONFIDENCE", 0.35))
+    min_confidence = float(_config_value("JUDGE", "MIN_PERSON_CONFIDENCE", 0.55))
     if confidence < min_confidence:
+        return False
+    valid_keypoints = int(person.get("valid_keypoint_count", 0) or 0)
+    if person.get("keypoint_backend") == "openpose" and valid_keypoints < int(_config_value("JUDGE", "MIN_VALID_KEYPOINTS", 8)):
         return False
     bbox = person.get("bbox") or []
     if len(bbox) == 4:
         width = max(0, float(bbox[2]) - float(bbox[0]))
         height = max(0, float(bbox[3]) - float(bbox[1]))
-        if width * height < float(_config_value("JUDGE", "MIN_PERSON_BBOX_AREA", 8000)):
+        if width * height < float(_config_value("JUDGE", "MIN_PERSON_BBOX_AREA", 25000)):
+            return False
+        if height < float(_config_value("JUDGE", "MIN_PERSON_BBOX_HEIGHT", 180)):
             return False
     return True
 
