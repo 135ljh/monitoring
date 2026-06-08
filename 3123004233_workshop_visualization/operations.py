@@ -1,24 +1,28 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
+import datetime as dt
 import json
 import os
 import threading
 from collections import Counter, deque
 
+import pymysql
 import uvicorn
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse
 from kafka import KafkaConsumer
 
 
+RECOGNITION_RESULT_TOPIC = "workshop.recognition_result"
 ABNORMAL_EVENT_TOPIC = "workshop.abnormal_event"
 ALARM_RESULT_TOPIC = "workshop.alarm_result"
 DEFAULT_GROUP = "workshop-visualization"
 
 _TASKS = {}
 _LOCK = threading.Lock()
-_EVENTS = deque(maxlen=200)
-_ALARMS = deque(maxlen=200)
+_RECOGNITIONS = deque(maxlen=200)
+_EVENTS = deque(maxlen=500)
+_ALARMS = deque(maxlen=500)
 _SERVER_STARTED = False
 
 
@@ -27,11 +31,16 @@ def start_visualize(data):
     if not monitor_id:
         raise ValueError("monitor_id is required")
 
-    abnormal_topic = (data or {}).get("abnormal_event_topic") or _config_value("KAFKA", "ABNORMAL_EVENT_TOPIC", ABNORMAL_EVENT_TOPIC)
-    alarm_topic = (data or {}).get("alarm_result_topic") or _config_value("KAFKA", "ALARM_RESULT_TOPIC", ALARM_RESULT_TOPIC)
+    recognition_topic = (data or {}).get("recognition_result_topic") or _config_value(
+        "KAFKA", "RECOGNITION_RESULT_TOPIC", RECOGNITION_RESULT_TOPIC)
+    abnormal_topic = (data or {}).get("abnormal_event_topic") or _config_value(
+        "KAFKA", "ABNORMAL_EVENT_TOPIC", ABNORMAL_EVENT_TOPIC)
+    alarm_topic = (data or {}).get("alarm_result_topic") or _config_value(
+        "KAFKA", "ALARM_RESULT_TOPIC", ALARM_RESULT_TOPIC)
     port = int(_config_value("VISUALIZATION", "PORT", os.getenv("VISUALIZATION_PORT", 8088)))
     host = _config_value("VISUALIZATION", "HOST", os.getenv("VISUALIZATION_HOST", "127.0.0.1"))
-    dashboard_url = "http://%s:%s/workshop-dashboard?monitor_id=%s" % (host, port, monitor_id)
+    public_host = _config_value("VISUALIZATION", "PUBLIC_HOST", host)
+    dashboard_url = "http://%s:%s/workshop-dashboard?monitor_id=%s" % (public_host, port, monitor_id)
 
     with _LOCK:
         task = _TASKS.get(monitor_id)
@@ -40,14 +49,19 @@ def start_visualize(data):
 
         task = {
             "monitor_id": monitor_id,
+            "recognition_topic": recognition_topic,
             "abnormal_topic": abnormal_topic,
             "alarm_topic": alarm_topic,
             "status": "running",
             "stop_event": threading.Event(),
         }
         _TASKS[monitor_id] = task
-        threading.Thread(target=_consume_events, args=(task,), daemon=True, name="visual-events-%s" % monitor_id).start()
-        threading.Thread(target=_consume_alarms, args=(task,), daemon=True, name="visual-alarms-%s" % monitor_id).start()
+        threading.Thread(target=_consume_topic, args=(task, recognition_topic, _RECOGNITIONS, "recognition"),
+                         daemon=True, name="visual-recognition-%s" % monitor_id).start()
+        threading.Thread(target=_consume_topic, args=(task, abnormal_topic, _EVENTS, "event"),
+                         daemon=True, name="visual-events-%s" % monitor_id).start()
+        threading.Thread(target=_consume_topic, args=(task, alarm_topic, _ALARMS, "alarm"),
+                         daemon=True, name="visual-alarms-%s" % monitor_id).start()
         _ensure_server(host, port)
 
     _set_status(monitor_id, "running")
@@ -74,41 +88,51 @@ def _build_app():
     def dashboard():
         return HTML
 
+    @app.get("/api/live")
+    def live(monitor_id: str = None):
+        return {
+            "msg": "success",
+            "data": {
+                "monitor_id": monitor_id,
+                "recognition": _latest(_RECOGNITIONS, monitor_id),
+                "event": _latest(_EVENTS, monitor_id),
+                "alarm": _latest(_ALARMS, monitor_id),
+                "updated_at": _now_text(),
+            },
+        }
+
     @app.get("/api/events")
-    def events(monitor_id: str = None):
-        data = [item for item in list(_EVENTS) if not monitor_id or item.get("monitor_id") == monitor_id]
-        return list(reversed(data[-100:]))
+    def events(monitor_id: str = None, limit: int = 100):
+        return {"msg": "success", "data": _recent(_EVENTS, monitor_id, limit)}
 
     @app.get("/api/alarms")
-    def alarms(monitor_id: str = None):
-        data = [item for item in list(_ALARMS) if not monitor_id or item.get("monitor_id") == monitor_id]
-        return list(reversed(data[-100:]))
+    def alarms(monitor_id: str = None, limit: int = 100):
+        return {"msg": "success", "data": _recent(_ALARMS, monitor_id, limit)}
 
     @app.get("/api/stats")
     def stats(monitor_id: str = None):
-        data = [item for item in list(_EVENTS) if not monitor_id or item.get("monitor_id") == monitor_id]
+        events_data = [item for item in list(_EVENTS) if _match_monitor(item, monitor_id)]
         type_counter = Counter()
         level_counter = Counter()
-        for event in data:
+        for event in events_data:
             level_counter[event.get("abnormal_level", "unknown")] += 1
             for item in event.get("abnormal_types", []):
                 type_counter[item] += 1
         return {
-            "total": len(data),
-            "types": dict(type_counter),
-            "levels": dict(level_counter),
-            "latest": data[-1] if data else None,
+            "msg": "success",
+            "data": {
+                "total": len(events_data),
+                "types": dict(type_counter),
+                "levels": dict(level_counter),
+                "latest": events_data[-1] if events_data else None,
+            },
         }
 
+    @app.get("/api/sensors")
+    def sensors(monitor_id: str = None, limit: int = 180):
+        return {"msg": "success", "data": _sensor_snapshot(monitor_id, limit)}
+
     return app
-
-
-def _consume_events(task):
-    _consume_topic(task, task["abnormal_topic"], _EVENTS, "event")
-
-
-def _consume_alarms(task):
-    _consume_topic(task, task["alarm_topic"], _ALARMS, "alarm")
 
 
 def _consume_topic(task, topic, sink, label):
@@ -134,6 +158,98 @@ def _consume_topic(task, topic, sink, label):
     finally:
         if consumer:
             consumer.close()
+
+
+def _sensor_snapshot(monitor_id, limit):
+    rows = _query_sensor_rows(monitor_id, limit)
+    latest_by_code = {}
+    for row in rows:
+        latest_by_code.setdefault(row["sensor_code"], row)
+    latest = list(latest_by_code.values())
+    latest.sort(key=lambda item: item.get("sensor_code") or "")
+
+    series = {}
+    for row in reversed(rows):
+        code = row["sensor_code"]
+        series.setdefault(code, {"name": row.get("sensor_name") or code, "unit": row.get("unit") or "", "values": []})
+        series[code]["values"].append({"time": _dt_text(row.get("collected_at")), "value": row.get("value")})
+
+    return {
+        "latest": latest,
+        "series": series,
+        "updated_at": _dt_text(max([row.get("collected_at") for row in latest], default=None)),
+    }
+
+
+def _query_sensor_rows(monitor_id, limit):
+    conn = _mysql_conn()
+    if not conn:
+        return []
+    try:
+        with conn.cursor(pymysql.cursors.DictCursor) as cur:
+            if monitor_id:
+                cur.execute("""
+                    SELECT monitor_id, panel_no, sensor_code, sensor_name, address, raw_value,
+                           value, unit, status, collected_at
+                    FROM sensor_data_record
+                    WHERE monitor_id=%s
+                    ORDER BY collected_at DESC, id DESC
+                    LIMIT %s
+                """, (monitor_id, int(limit)))
+            else:
+                cur.execute("""
+                    SELECT monitor_id, panel_no, sensor_code, sensor_name, address, raw_value,
+                           value, unit, status, collected_at
+                    FROM sensor_data_record
+                    ORDER BY collected_at DESC, id DESC
+                    LIMIT %s
+                """, (int(limit),))
+            return list(cur.fetchall())
+    except Exception as exc:
+        print("query sensor rows failed: %s" % exc)
+        return []
+    finally:
+        conn.close()
+
+
+def _mysql_conn():
+    cfg = _config_value("MYSQL", None, {}) or {}
+    if not isinstance(cfg, dict):
+        cfg = {}
+    host = cfg.get("HOST", os.getenv("MYSQL_HOST", "127.0.0.1"))
+    port = int(cfg.get("PORT", os.getenv("MYSQL_PORT", 3306)))
+    user = cfg.get("USER", os.getenv("MYSQL_USER", "root"))
+    password = cfg.get("PASSWORD", os.getenv("MYSQL_PASSWORD", "123456"))
+    database = cfg.get("DATABASE", os.getenv("MYSQL_DATABASE", "workshop_monitoring"))
+    try:
+        return pymysql.connect(
+            host=host,
+            port=port,
+            user=user,
+            password=password,
+            database=database,
+            charset="utf8mb4",
+            autocommit=True,
+        )
+    except Exception as exc:
+        print("mysql unavailable for visualization: %s" % exc)
+        return None
+
+
+def _recent(items, monitor_id, limit):
+    data = [item for item in list(items) if _match_monitor(item, monitor_id)]
+    return list(reversed(data[-max(1, min(int(limit), 500)):]))
+
+
+def _latest(items, monitor_id):
+    for item in reversed(list(items)):
+        if _match_monitor(item, monitor_id):
+            return item
+    return None
+
+
+def _match_monitor(item, monitor_id):
+    return not monitor_id or item.get("monitor_id") == monitor_id
 
 
 def _bootstrap_servers():
@@ -162,6 +278,8 @@ def _config_value(section, key, default=None):
     except Exception:
         cfg = {}
     section_cfg = cfg.get(section, {}) if isinstance(cfg, dict) else {}
+    if key is None:
+        return section_cfg if isinstance(section_cfg, dict) else default
     if isinstance(section_cfg, dict) and section_cfg.get(key) is not None:
         return section_cfg.get(key)
     return cfg.get(key, default) if isinstance(cfg, dict) else default
@@ -171,86 +289,372 @@ def _response(monitor_id, dashboard_url, status):
     return {"msg": "success", "data": {"monitor_id": monitor_id, "dashboard_url": dashboard_url, "status": status}}
 
 
-HTML = """
+def _now_text():
+    return dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _dt_text(value):
+    if not value:
+        return ""
+    if isinstance(value, dt.datetime):
+        return value.strftime("%Y-%m-%d %H:%M:%S")
+    return str(value)[:19]
+
+
+HTML = r"""
 <!doctype html>
 <html lang="zh-CN">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>车间视频监测</title>
-  <script src="https://cdn.jsdelivr.net/npm/echarts@5/dist/echarts.min.js"></script>
+  <title>车间监测实时可视化</title>
   <style>
-    body { margin:0; font-family: Arial, "Microsoft YaHei", sans-serif; background:#f4f6f8; color:#17202a; }
-    header { height:56px; display:flex; align-items:center; padding:0 24px; background:#152238; color:#fff; font-size:20px; font-weight:700; }
-    main { padding:18px; display:grid; grid-template-columns: 1.2fr .8fr; gap:16px; }
-    section { background:#fff; border:1px solid #d8dee6; border-radius:6px; padding:14px; min-width:0; }
-    h2 { font-size:15px; margin:0 0 12px; }
-    .media { aspect-ratio:16/9; background:#101820; display:flex; align-items:center; justify-content:center; overflow:hidden; border-radius:4px; }
-    .media img { width:100%; height:100%; object-fit:contain; }
-    .grid { display:grid; grid-template-columns:1fr 1fr; gap:16px; }
-    .list { display:flex; flex-direction:column; gap:10px; max-height:460px; overflow:auto; }
-    .item { border-left:4px solid #d7263d; background:#f8fafc; padding:10px; border-radius:4px; font-size:13px; }
-    .muted { color:#687385; }
-    .charts { display:grid; grid-template-columns:1fr 1fr; gap:16px; }
-    .chart { height:260px; }
-    a { color:#0b6bcb; word-break:break-all; }
-    @media (max-width: 900px) { main, .grid, .charts { grid-template-columns:1fr; } }
+    :root {
+      --base: #111;
+      --surface: #1c1c1c;
+      --elevated: #252525;
+      --border: #2a2a2a;
+      --heading: #f1f5f9;
+      --body: #94a3b8;
+      --muted: #64748b;
+      --accent: #10b981;
+      --danger: #ef4444;
+      --warn: #f59e0b;
+      --blue: #60a5fa;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      background:
+        radial-gradient(circle at 18px 18px, rgba(148, 163, 184, 0.14) 1px, transparent 1px),
+        linear-gradient(180deg, #111 0%, #171717 100%);
+      background-size: 36px 36px, auto;
+      color: var(--body);
+      font-family: "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
+    }
+    .shell { width: min(1500px, calc(100vw - 32px)); margin: 0 auto; padding: 22px 0; }
+    .topbar, .panel, .metric {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      box-shadow: inset 0 1px 0 rgba(255,255,255,.03);
+    }
+    .topbar { min-height: 84px; display: flex; align-items: center; justify-content: space-between; padding: 18px 22px; margin-bottom: 16px; }
+    .eyebrow { color: var(--accent); font-size: 11px; font-weight: 700; letter-spacing: .08em; margin: 0 0 8px; }
+    h1, h2 { color: var(--heading); margin: 0; letter-spacing: 0; }
+    h1 { font-size: 24px; }
+    h2 { font-size: 16px; }
+    .toolbar { display: flex; gap: 10px; align-items: center; white-space: nowrap; }
+    .pill { border: 1px solid var(--border); background: var(--elevated); border-radius: 999px; padding: 7px 10px; font-size: 12px; }
+    .status-dot { width: 9px; height: 9px; border-radius: 999px; display: inline-block; background: var(--muted); }
+    .status-dot.online { background: var(--accent); box-shadow: 0 0 0 4px rgba(16,185,129,.12); }
+    .status-dot.error { background: var(--danger); box-shadow: 0 0 0 4px rgba(239,68,68,.12); }
+    .layout { display: grid; grid-template-columns: 1.45fr .9fr; gap: 16px; }
+    .panel { padding: 18px; min-width: 0; }
+    .panel-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; margin-bottom: 14px; }
+    .camera-wrap { position: relative; aspect-ratio: 16 / 9; background: #070707; border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
+    .camera-wrap img { width: 100%; height: 100%; object-fit: contain; display: block; }
+    .empty { color: var(--muted); display: grid; min-height: 100%; place-items: center; }
+    .region { position: absolute; border: 3px solid var(--danger); box-shadow: 0 0 0 1px rgba(255,255,255,.25), 0 0 18px rgba(239,68,68,.55); pointer-events: none; }
+    .region span { position: absolute; left: -3px; top: -28px; background: var(--danger); color: #fff; font-size: 12px; padding: 4px 8px; border-radius: 6px 6px 6px 0; white-space: nowrap; }
+    .metrics { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-bottom: 16px; }
+    .metric { min-height: 102px; padding: 16px; position: relative; }
+    .metric strong { color: var(--heading); display: block; font: 700 28px Consolas, monospace; margin-top: 18px; }
+    .metric small, .caption { color: var(--muted); font-size: 12px; }
+    .metric.warn { border-color: rgba(245,158,11,.55); }
+    .metric.danger { border-color: rgba(239,68,68,.7); }
+    .split { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-top: 16px; }
+    .list { display: grid; gap: 10px; max-height: 420px; overflow: auto; }
+    .item { background: var(--elevated); border: 1px solid var(--border); border-left: 4px solid var(--danger); border-radius: 8px; padding: 11px 12px; }
+    .item strong { color: var(--heading); display: block; font-size: 14px; margin-bottom: 6px; }
+    .item p { margin: 0; font-size: 13px; line-height: 1.5; }
+    .table-wrap { max-height: 360px; overflow: auto; }
+    table { border-collapse: collapse; width: 100%; min-width: 720px; }
+    th, td { border-bottom: 1px solid var(--border); padding: 10px; text-align: left; font-size: 13px; }
+    th { color: var(--muted); font-weight: 700; }
+    td { color: var(--body); }
+    .charts { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-top: 16px; }
+    canvas { background: #151515; border: 1px solid var(--border); border-radius: 8px; width: 100%; height: 260px; display: block; }
+    a { color: var(--blue); word-break: break-all; }
+    @media (max-width: 1050px) { .layout, .split, .charts { grid-template-columns: 1fr; } .metrics { grid-template-columns: repeat(2, 1fr); } }
+    @media (max-width: 640px) { .topbar { align-items: flex-start; flex-direction: column; } .metrics { grid-template-columns: 1fr; } }
   </style>
 </head>
 <body>
-  <header>车间视频监测异常行为分析系统</header>
-  <main>
-    <section>
-      <h2>实时异常画面</h2>
-      <div class="media" id="media"><span class="muted">等待异常证据帧</span></div>
-    </section>
-    <section>
-      <h2>异常概览</h2>
-      <div id="summary" class="muted">加载中</div>
-    </section>
-    <section>
-      <h2>异常事件</h2>
-      <div id="events" class="list"></div>
-    </section>
-    <section>
-      <h2>报警状态</h2>
-      <div id="alarms" class="list"></div>
-    </section>
-    <section style="grid-column:1 / -1">
-      <h2>统计图表</h2>
-      <div class="charts">
-        <div id="typeChart" class="chart"></div>
-        <div id="levelChart" class="chart"></div>
+  <main class="shell">
+    <header class="topbar">
+      <div>
+        <p class="eyebrow">WORKSHOP MONITORING</p>
+        <h1>车间监测实时可视化面板</h1>
       </div>
+      <div class="toolbar">
+        <span id="statusDot" class="status-dot"></span>
+        <span id="statusText" class="pill">连接中</span>
+        <span id="monitorLabel" class="pill">--</span>
+      </div>
+    </header>
+
+    <section class="metrics">
+      <article class="metric"><small>异常总数</small><strong id="totalEvents">0</strong></article>
+      <article class="metric"><small>当前人数</small><strong id="personCount">0</strong></article>
+      <article class="metric"><small>最新等级</small><strong id="latestLevel">--</strong></article>
+      <article class="metric"><small>更新时间</small><strong id="updatedAt" style="font-size:18px">--</strong></article>
+    </section>
+
+    <section class="layout">
+      <article class="panel">
+        <div class="panel-head">
+          <div>
+            <p class="eyebrow">LIVE CAMERA</p>
+            <h2>实时摄像头画面与异常红框</h2>
+          </div>
+          <span id="clipInfo" class="caption">等待视频帧</span>
+        </div>
+        <div id="camera" class="camera-wrap"><div class="empty">等待识别画面</div></div>
+      </article>
+
+      <article class="panel">
+        <div class="panel-head">
+          <div>
+            <p class="eyebrow">EVENTS</p>
+            <h2>异常事件列表</h2>
+          </div>
+        </div>
+        <div id="events" class="list"><span class="caption">暂无事件</span></div>
+      </article>
+    </section>
+
+    <section class="split">
+      <article class="panel">
+        <div class="panel-head"><div><p class="eyebrow">SENSORS</p><h2>实时传感器数据</h2></div><span id="sensorTime" class="caption">--</span></div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>传感器</th><th>地址</th><th>当前值</th><th>单位</th><th>状态</th><th>采集时间</th></tr></thead>
+            <tbody id="sensorRows"><tr><td colspan="6" class="caption">等待传感器数据</td></tr></tbody>
+          </table>
+        </div>
+      </article>
+
+      <article class="panel">
+        <div class="panel-head"><div><p class="eyebrow">ALARMS</p><h2>报警推送状态</h2></div></div>
+        <div id="alarms" class="list"><span class="caption">暂无报警</span></div>
+      </article>
+    </section>
+
+    <section class="charts">
+      <article class="panel">
+        <div class="panel-head"><div><p class="eyebrow">TYPE DISTRIBUTION</p><h2>异常类型分布</h2></div></div>
+        <canvas id="typeChart"></canvas>
+      </article>
+      <article class="panel">
+        <div class="panel-head"><div><p class="eyebrow">SENSOR TREND</p><h2>传感器趋势</h2></div></div>
+        <canvas id="sensorChart"></canvas>
+      </article>
     </section>
   </main>
+
   <script>
     const params = new URLSearchParams(location.search);
     const monitorId = params.get("monitor_id") || "";
-    const typeChart = echarts.init(document.getElementById("typeChart"));
-    const levelChart = echarts.init(document.getElementById("levelChart"));
-    async function loadJson(path) {
-      const q = monitorId ? `?monitor_id=${encodeURIComponent(monitorId)}` : "";
-      const res = await fetch(path + q);
-      return res.json();
+    document.getElementById("monitorLabel").textContent = monitorId || "全部监控";
+
+    function q(path) {
+      const join = path.includes("?") ? "&" : "?";
+      return monitorId ? `${path}${join}monitor_id=${encodeURIComponent(monitorId)}` : path;
     }
-    function item(text, sub) {
-      return `<div class="item"><div>${text}</div><div class="muted">${sub || ""}</div></div>`;
+    async function json(path) {
+      const res = await fetch(q(path), { cache: "no-store" });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const body = await res.json();
+      return body.data || body;
+    }
+    function setStatus(type, text) {
+      document.getElementById("statusDot").className = `status-dot ${type}`;
+      document.getElementById("statusText").textContent = text;
+    }
+    function esc(value) {
+      return String(value ?? "").replace(/[&<>"']/g, s => ({ "&":"&amp;", "<":"&lt;", ">":"&gt;", '"':"&quot;", "'":"&#39;" }[s]));
+    }
+    function num(value, digits = 2) {
+      if (value === null || value === undefined || Number.isNaN(Number(value))) return "--";
+      const n = Number(value);
+      return Number.isInteger(n) ? String(n) : n.toFixed(digits);
+    }
+    function latestFrame(live) {
+      return live.event?.evidence_frame_url || live.recognition?.annotated_frame_url || "";
+    }
+    function latestRegions(live) {
+      return live.event?.abnormal_regions || [];
+    }
+    function renderCamera(live) {
+      const frame = latestFrame(live);
+      const regions = latestRegions(live);
+      const camera = document.getElementById("camera");
+      if (!frame) {
+        camera.innerHTML = '<div class="empty">等待识别画面</div>';
+        return;
+      }
+      camera.innerHTML = `<img id="cameraImg" src="${esc(cacheBust(frame))}" alt="实时摄像头画面">`;
+      const img = document.getElementById("cameraImg");
+      img.addEventListener("load", () => drawRegions(camera, img, regions), { once: true });
+      document.getElementById("clipInfo").textContent = live.event?.clip_id || live.recognition?.clip_id || "实时帧";
+    }
+    function drawRegions(container, img, regions) {
+      container.querySelectorAll(".region").forEach(item => item.remove());
+      const naturalW = img.naturalWidth || 1;
+      const naturalH = img.naturalHeight || 1;
+      const box = img.getBoundingClientRect();
+      const parent = container.getBoundingClientRect();
+      const scale = Math.min(box.width / naturalW, box.height / naturalH);
+      const displayW = naturalW * scale;
+      const displayH = naturalH * scale;
+      const offsetX = (parent.width - displayW) / 2;
+      const offsetY = (parent.height - displayH) / 2;
+      regions.forEach(region => {
+        const b = region.bbox || [];
+        if (b.length !== 4) return;
+        const el = document.createElement("div");
+        el.className = "region";
+        el.style.left = `${offsetX + b[0] * scale}px`;
+        el.style.top = `${offsetY + b[1] * scale}px`;
+        el.style.width = `${Math.max(2, (b[2] - b[0]) * scale)}px`;
+        el.style.height = `${Math.max(2, (b[3] - b[1]) * scale)}px`;
+        el.innerHTML = `<span>${esc(region.label || region.type || "异常")}</span>`;
+        container.appendChild(el);
+      });
+    }
+    function cacheBust(url) {
+      return `${url}${url.includes("?") ? "&" : "?"}t=${Date.now()}`;
+    }
+    function renderEvents(events) {
+      document.getElementById("events").innerHTML = events.map(e => `
+        <div class="item">
+          <strong>${esc(e.event_time || "")} ${esc((e.abnormal_types || []).join(", "))}</strong>
+          <p>${esc(e.event_description || "")}</p>
+          ${e.evidence_video_url ? `<p><a href="${esc(e.evidence_video_url)}" target="_blank">证据视频</a></p>` : ""}
+        </div>
+      `).join("") || '<span class="caption">暂无事件</span>';
+    }
+    function renderAlarms(alarms) {
+      document.getElementById("alarms").innerHTML = alarms.map(a => `
+        <div class="item">
+          <strong>${esc(a.alarm_time || "")} ${esc(a.notify_status || "")}</strong>
+          <p>${esc(a.notify_message || a.notify_status || "")}</p>
+        </div>
+      `).join("") || '<span class="caption">暂无报警</span>';
+    }
+    function renderSensors(data) {
+      document.getElementById("sensorTime").textContent = data.updated_at || "--";
+      const rows = data.latest || [];
+      document.getElementById("sensorRows").innerHTML = rows.map(row => `
+        <tr>
+          <td>${esc(row.sensor_name || row.sensor_code)}</td>
+          <td>${esc(row.address)}</td>
+          <td>${num(row.value)}</td>
+          <td>${esc(row.unit || "")}</td>
+          <td>${esc(row.status || "")}</td>
+          <td>${esc((row.collected_at || "").slice(0, 19))}</td>
+        </tr>
+      `).join("") || '<tr><td colspan="6" class="caption">等待传感器数据</td></tr>';
+      drawSensorChart(data.series || {});
+    }
+    function setupCanvas(id) {
+      const canvas = document.getElementById(id);
+      const rect = canvas.getBoundingClientRect();
+      const ratio = window.devicePixelRatio || 1;
+      canvas.width = Math.max(1, Math.floor(rect.width * ratio));
+      canvas.height = Math.max(1, Math.floor(rect.height * ratio));
+      const ctx = canvas.getContext("2d");
+      ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
+      return { ctx, w: rect.width, h: rect.height };
+    }
+    function drawTypeChart(types) {
+      const { ctx, w, h } = setupCanvas("typeChart");
+      ctx.clearRect(0, 0, w, h);
+      const entries = Object.entries(types || {});
+      if (!entries.length) return emptyChart(ctx, w, h, "暂无异常事件");
+      const max = Math.max(...entries.map(([,v]) => v), 1);
+      const pad = 36, gap = 12;
+      const bw = Math.max(18, (w - pad * 2 - gap * (entries.length - 1)) / entries.length);
+      entries.forEach(([name, value], i) => {
+        const x = pad + i * (bw + gap);
+        const bh = (h - 80) * value / max;
+        const y = h - 42 - bh;
+        ctx.fillStyle = "#ef4444";
+        ctx.fillRect(x, y, bw, bh);
+        ctx.fillStyle = "#94a3b8";
+        ctx.font = "12px Consolas, monospace";
+        ctx.fillText(value, x, y - 8);
+        ctx.save();
+        ctx.translate(x, h - 24);
+        ctx.rotate(-0.35);
+        ctx.fillText(name, 0, 0);
+        ctx.restore();
+      });
+    }
+    function drawSensorChart(series) {
+      const { ctx, w, h } = setupCanvas("sensorChart");
+      ctx.clearRect(0, 0, w, h);
+      const preferred = ["temperature", "humidity", "noise", "voltage"];
+      const code = preferred.find(item => series[item]?.values?.length) || Object.keys(series)[0];
+      const values = series[code]?.values || [];
+      if (!values.length) return emptyChart(ctx, w, h, "暂无传感器趋势");
+      const nums = values.map(v => Number(v.value)).filter(Number.isFinite);
+      let min = Math.min(...nums), max = Math.max(...nums);
+      if (min === max) { min -= 1; max += 1; }
+      const pad = { l: 52, r: 18, t: 24, b: 34 };
+      ctx.strokeStyle = "#2a2a2a";
+      ctx.beginPath();
+      for (let i = 0; i <= 4; i++) {
+        const y = pad.t + (h - pad.t - pad.b) * i / 4;
+        ctx.moveTo(pad.l, y); ctx.lineTo(w - pad.r, y);
+      }
+      ctx.stroke();
+      ctx.strokeStyle = "#10b981";
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      values.forEach((item, i) => {
+        const x = values.length === 1 ? pad.l : pad.l + (w - pad.l - pad.r) * i / (values.length - 1);
+        const y = pad.t + (h - pad.t - pad.b) - ((Number(item.value) - min) / (max - min)) * (h - pad.t - pad.b);
+        if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+      });
+      ctx.stroke();
+      ctx.fillStyle = "#94a3b8";
+      ctx.font = "13px Consolas, monospace";
+      ctx.fillText(`${series[code]?.name || code} ${series[code]?.unit || ""}`, pad.l, 18);
+    }
+    function emptyChart(ctx, w, h, text) {
+      ctx.fillStyle = "#64748b";
+      ctx.font = "14px Microsoft YaHei, sans-serif";
+      ctx.fillText(text, 20, 34);
     }
     async function refresh() {
-      const [events, alarms, stats] = await Promise.all([loadJson("/api/events"), loadJson("/api/alarms"), loadJson("/api/stats")]);
-      const latest = stats.latest;
-      document.getElementById("summary").innerHTML = `异常总数：<b>${stats.total}</b><br>当前任务：${monitorId || "全部"}`;
-      document.getElementById("events").innerHTML = events.map(e => item(`${e.event_time || ""} ${e.abnormal_level || ""} ${e.event_description || ""}`, `<a href="${e.evidence_video_url || "#"}" target="_blank">证据视频</a>`)).join("") || "<span class='muted'>暂无事件</span>";
-      document.getElementById("alarms").innerHTML = alarms.map(a => item(`${a.alarm_time || ""} ${a.notify_status || ""}`, a.notify_message || "")).join("") || "<span class='muted'>暂无报警</span>";
-      if (latest && latest.evidence_frame_url) {
-        document.getElementById("media").innerHTML = `<img src="${latest.evidence_frame_url}" alt="异常证据帧">`;
+      try {
+        const [live, eventsBody, alarmsBody, statsBody, sensors] = await Promise.all([
+          json("/api/live"),
+          json("/api/events?limit=40"),
+          json("/api/alarms?limit=40"),
+          json("/api/stats"),
+          json("/api/sensors?limit=240"),
+        ]);
+        renderCamera(live);
+        renderEvents(eventsBody);
+        renderAlarms(alarmsBody);
+        renderSensors(sensors);
+        document.getElementById("totalEvents").textContent = statsBody.total || 0;
+        document.getElementById("personCount").textContent = live.recognition?.scene_result?.person_count ?? 0;
+        document.getElementById("latestLevel").textContent = live.event?.abnormal_level || "--";
+        document.getElementById("updatedAt").textContent = live.updated_at || "--";
+        drawTypeChart(statsBody.types || {});
+        setStatus("online", "实时刷新中");
+      } catch (err) {
+        setStatus("error", err.message);
       }
-      typeChart.setOption({ tooltip:{}, xAxis:{type:"category", data:Object.keys(stats.types)}, yAxis:{type:"value"}, series:[{type:"bar", data:Object.values(stats.types), color:"#0b6bcb"}] });
-      levelChart.setOption({ tooltip:{}, series:[{type:"pie", radius:"65%", data:Object.entries(stats.levels).map(([name,value]) => ({name, value}))}] });
     }
     refresh();
-    setInterval(refresh, 3000);
+    setInterval(refresh, 2500);
+    window.addEventListener("resize", refresh);
   </script>
 </body>
 </html>

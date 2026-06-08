@@ -425,6 +425,7 @@ def _judge_message(msg):
     monitor_id = msg["monitor_id"]
     abnormal_types = []
     descriptions = []
+    abnormal_regions = []
     scene = msg.get("scene_result", {}) or {}
 
     for person in msg.get("person_results", []):
@@ -439,6 +440,7 @@ def _judge_message(msg):
         _judge_person_running(monitor_id, msg, person, person_id, abnormal_types, descriptions)
         _judge_help_gesture(monitor_id, msg, person, person_id, abnormal_types, descriptions)
         _judge_fall_no_movement(monitor_id, msg, person, person_id, abnormal_types, descriptions)
+        _append_person_region(person, abnormal_regions)
 
     _judge_person_absent(monitor_id, msg, scene, abnormal_types, descriptions)
     _judge_crowd_gathering(monitor_id, msg, scene, abnormal_types, descriptions)
@@ -460,7 +462,23 @@ def _judge_message(msg):
         "event_time": _now_text(),
         "camera_id": msg.get("camera_id"),
         "clip_id": msg.get("clip_id"),
+        "abnormal_regions": abnormal_regions,
     }
+
+
+def _append_person_region(person, regions):
+    bbox = person.get("bbox") or []
+    if len(bbox) != 4:
+        return
+    regions.append({
+        "type": "person",
+        "label": person.get("person_id", "person"),
+        "bbox": [int(float(value)) for value in bbox],
+        "action_type": person.get("action_type"),
+        "posture_type": person.get("posture_type"),
+        "fall_suspected": bool(person.get("fall_suspected")),
+        "help_gesture_suspected": bool(person.get("help_gesture_suspected")),
+    })
 
 
 def _judge_person_static(monitor_id, msg, person, person_id, abnormal_types, descriptions):
