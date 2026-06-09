@@ -96,14 +96,18 @@ def _build_app():
 
     @app.get("/api/live")
     def live(monitor_id: str = None):
+        recognition = _latest(_RECOGNITIONS, monitor_id)
+        event = _latest(_EVENTS, monitor_id)
+        alarm = _latest(_ALARMS, monitor_id)
+        effective_monitor_id = monitor_id or _record_monitor_id(recognition) or _record_monitor_id(event) or _record_monitor_id(alarm)
         return {
             "msg": "success",
             "data": {
-                "monitor_id": monitor_id,
-                "recognition": _latest(_RECOGNITIONS, monitor_id),
-                "event": _latest(_EVENTS, monitor_id),
-                "alarm": _latest(_ALARMS, monitor_id),
-                "camera_stream_url": "/api/camera-stream?monitor_id=%s" % monitor_id if monitor_id else "/api/camera-stream",
+                "monitor_id": effective_monitor_id,
+                "recognition": recognition,
+                "event": event,
+                "alarm": alarm,
+                "camera_stream_url": "/api/camera-stream?monitor_id=%s" % effective_monitor_id if effective_monitor_id else "/api/camera-stream",
                 "updated_at": _now_text(),
             },
         }
@@ -445,6 +449,12 @@ def _response(monitor_id, dashboard_url, status):
     }
 
 
+def _record_monitor_id(record):
+    if isinstance(record, dict):
+        return record.get("monitor_id")
+    return None
+
+
 def _now_text():
     return dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -643,7 +653,10 @@ HTML = r"""
     function renderCamera(live) {
       const regions = latestRegions(live);
       const camera = document.getElementById("camera");
-      const streamUrl = q("/api/camera-stream");
+      const effectiveMonitorId = monitorId || live.monitor_id || live.event?.monitor_id || live.recognition?.monitor_id || "";
+      const streamUrl = effectiveMonitorId
+        ? `/api/camera-stream?monitor_id=${encodeURIComponent(effectiveMonitorId)}`
+        : "/api/camera-stream";
       if (camera.dataset.streamUrl !== streamUrl) {
         camera.dataset.streamUrl = streamUrl;
         camera.innerHTML = `<img id="cameraImg" src="${esc(streamUrl)}" alt="实时摄像头画面">`;
