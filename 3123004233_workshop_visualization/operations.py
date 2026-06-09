@@ -4,13 +4,15 @@ import datetime as dt
 import json
 import os
 import threading
+import time
 from collections import Counter, deque
 
+import cv2
 import pymysql
 import requests
 import uvicorn
 from fastapi import FastAPI
-from fastapi.responses import HTMLResponse, Response
+from fastapi.responses import HTMLResponse, Response, StreamingResponse
 from kafka import KafkaConsumer
 
 
@@ -38,6 +40,8 @@ def start_visualize(data):
         "KAFKA", "ABNORMAL_EVENT_TOPIC", ABNORMAL_EVENT_TOPIC)
     alarm_topic = (data or {}).get("alarm_result_topic") or _config_value(
         "KAFKA", "ALARM_RESULT_TOPIC", ALARM_RESULT_TOPIC)
+    camera_source = (data or {}).get("url") or (data or {}).get("camera_url") or _config_value(
+        "VISUALIZATION", "CAMERA_URL", os.getenv("VISUALIZATION_CAMERA_URL", "0"))
     port = int(_config_value("VISUALIZATION", "PORT", os.getenv("VISUALIZATION_PORT", 8088)))
     host = _config_value("VISUALIZATION", "HOST", os.getenv("VISUALIZATION_HOST", "127.0.0.1"))
     public_host = _config_value("VISUALIZATION", "PUBLIC_HOST", host)
@@ -53,6 +57,7 @@ def start_visualize(data):
             "recognition_topic": recognition_topic,
             "abnormal_topic": abnormal_topic,
             "alarm_topic": alarm_topic,
+            "camera_source": camera_source,
             "status": "running",
             "stop_event": threading.Event(),
         }
@@ -98,6 +103,7 @@ def _build_app():
                 "recognition": _latest(_RECOGNITIONS, monitor_id),
                 "event": _latest(_EVENTS, monitor_id),
                 "alarm": _latest(_ALARMS, monitor_id),
+                "camera_stream_url": "/api/camera-stream?monitor_id=%s" % monitor_id if monitor_id else "/api/camera-stream",
                 "updated_at": _now_text(),
             },
         }
@@ -143,7 +149,101 @@ def _build_app():
         except Exception as exc:
             return Response(content=("image proxy failed: %s" % exc).encode("utf-8"), status_code=502)
 
+    @app.get("/api/camera-stream")
+    def camera_stream(monitor_id: str = None):
+        source = _camera_source(monitor_id)
+        return StreamingResponse(
+            _mjpeg_frames(source, monitor_id),
+            media_type="multipart/x-mixed-replace; boundary=frame",
+        )
+
     return app
+
+
+def _camera_source(monitor_id):
+    task = _TASKS.get(monitor_id or "")
+    if task:
+        return task.get("camera_source", "0")
+    return _config_value("VISUALIZATION", "CAMERA_URL", os.getenv("VISUALIZATION_CAMERA_URL", "0"))
+
+
+def _mjpeg_frames(source, monitor_id=None):
+    capture = None
+    try:
+        while True:
+            payload = _latest_cached_frame(monitor_id)
+            if payload:
+                yield b"--frame\r\nContent-Type: image/jpeg\r\nCache-Control: no-cache\r\n\r\n" + payload + b"\r\n"
+                time.sleep(0.12)
+                continue
+
+            if capture is None:
+                capture = _open_capture(source)
+            ok, frame = capture.read()
+            if not ok or frame is None:
+                time.sleep(0.2)
+                if not capture.isOpened():
+                    capture.release()
+                    capture = _open_capture(source)
+                continue
+            ok, encoded = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
+            if not ok:
+                continue
+            payload = encoded.tobytes()
+            yield b"--frame\r\nContent-Type: image/jpeg\r\nCache-Control: no-cache\r\n\r\n" + payload + b"\r\n"
+    finally:
+        if capture is not None:
+            capture.release()
+
+
+def _latest_cached_frame(monitor_id):
+    if not monitor_id:
+        return None
+    conn = None
+    try:
+        import functions
+
+        conn = functions.getRedisConn()
+        payload = conn.get("monitor:%s:latest_frame_jpeg" % monitor_id)
+        if payload:
+            return bytes(payload)
+    except Exception:
+        return None
+    finally:
+        if conn is not None:
+            try:
+                functions.releaseRedisConn(conn)
+            except Exception:
+                pass
+    return None
+
+
+def _open_capture(source):
+    parsed = _parse_camera_source(source)
+    if isinstance(parsed, int):
+        capture = cv2.VideoCapture(parsed, cv2.CAP_DSHOW)
+        if not capture.isOpened():
+            capture = cv2.VideoCapture(parsed)
+        return capture
+
+    os.environ.setdefault("OPENCV_FFMPEG_CAPTURE_OPTIONS", "rtsp_transport;tcp|stimeout;5000000")
+    try:
+        return cv2.VideoCapture(str(parsed), cv2.CAP_FFMPEG)
+    except Exception:
+        return cv2.VideoCapture(str(parsed))
+
+
+def _parse_camera_source(source):
+    text = str(source or "0").strip()
+    lowered = text.lower()
+    for prefix in ("camera://", "webcam://", "local_camera://"):
+        if lowered.startswith(prefix):
+            return int(lowered.replace(prefix, "") or "0")
+    if lowered in ("camera", "webcam", "local_camera"):
+        return 0
+    if text.isdigit():
+        return int(text)
+    return text
 
 
 def _consume_topic(task, topic, sink, label):
@@ -333,7 +433,16 @@ def _config_value(section, key, default=None):
 
 
 def _response(monitor_id, dashboard_url, status):
-    return {"msg": "success", "data": {"monitor_id": monitor_id, "dashboard_url": dashboard_url, "status": status}}
+    base_url = dashboard_url.split("/workshop-dashboard", 1)[0]
+    return {
+        "msg": "success",
+        "data": {
+            "monitor_id": monitor_id,
+            "dashboard_url": dashboard_url,
+            "camera_stream_url": "%s/api/camera-stream?monitor_id=%s" % (base_url, monitor_id),
+            "status": status,
+        },
+    }
 
 
 def _now_text():
@@ -528,24 +637,24 @@ HTML = r"""
       const n = Number(value);
       return Number.isInteger(n) ? String(n) : n.toFixed(digits);
     }
-    function latestFrame(live) {
-      return live.event?.evidence_frame_url || live.recognition?.annotated_frame_url || "";
-    }
     function latestRegions(live) {
       return live.event?.abnormal_regions || [];
     }
     function renderCamera(live) {
-      const frame = latestFrame(live);
       const regions = latestRegions(live);
       const camera = document.getElementById("camera");
-      if (!frame) {
-        camera.innerHTML = '<div class="empty">等待识别画面</div>';
-        return;
+      const streamUrl = q("/api/camera-stream");
+      if (camera.dataset.streamUrl !== streamUrl) {
+        camera.dataset.streamUrl = streamUrl;
+        camera.innerHTML = `<img id="cameraImg" src="${esc(streamUrl)}" alt="实时摄像头画面">`;
+        const img = document.getElementById("cameraImg");
+        img.addEventListener("load", () => drawRegions(camera, img, regions));
       }
-      camera.innerHTML = `<img id="cameraImg" src="${esc(cacheBust(proxyImage(frame)))}" alt="实时摄像头画面">`;
       const img = document.getElementById("cameraImg");
-      img.addEventListener("load", () => drawRegions(camera, img, regions), { once: true });
-      document.getElementById("clipInfo").textContent = live.event?.clip_id || live.recognition?.clip_id || "实时帧";
+      if (img && img.complete) {
+        drawRegions(camera, img, regions);
+      }
+      document.getElementById("clipInfo").textContent = live.event?.clip_id || live.recognition?.clip_id || "实时视频流";
     }
     function drawRegions(container, img, regions) {
       container.querySelectorAll(".region").forEach(item => item.remove());
@@ -570,12 +679,6 @@ HTML = r"""
         el.innerHTML = `<span>${esc(region.label || region.type || "异常")}</span>`;
         container.appendChild(el);
       });
-    }
-    function cacheBust(url) {
-      return `${url}${url.includes("?") ? "&" : "?"}t=${Date.now()}`;
-    }
-    function proxyImage(url) {
-      return `/api/proxy-image?url=${encodeURIComponent(url)}`;
     }
     function renderEvents(events) {
       document.getElementById("events").innerHTML = events.map(e => `
@@ -646,33 +749,76 @@ HTML = r"""
     function drawSensorChart(series) {
       const { ctx, w, h } = setupCanvas("sensorChart");
       ctx.clearRect(0, 0, w, h);
-      const preferred = ["temperature", "humidity", "noise", "voltage"];
-      const code = preferred.find(item => series[item]?.values?.length) || Object.keys(series)[0];
-      const values = series[code]?.values || [];
-      if (!values.length) return emptyChart(ctx, w, h, "暂无传感器趋势");
-      const nums = values.map(v => Number(v.value)).filter(Number.isFinite);
-      let min = Math.min(...nums), max = Math.max(...nums);
-      if (min === max) { min -= 1; max += 1; }
-      const pad = { l: 52, r: 18, t: 24, b: 34 };
+      const colors = {
+        voltage: "#10b981",
+        temperature: "#60a5fa",
+        humidity: "#a78bfa",
+        noise: "#fbbf24",
+        current: "#fb7185",
+        frequency: "#22d3ee",
+      };
+      const preferred = ["voltage", "temperature", "humidity", "noise", "current", "frequency"];
+      const items = preferred
+        .filter(code => series[code]?.values?.length)
+        .map(code => ({ code, ...series[code], color: colors[code] || "#10b981" }));
+      if (!items.length) return emptyChart(ctx, w, h, "暂无传感器趋势");
+      const pad = { l: 58, r: 22, t: 38, b: 38 };
+      const plotW = w - pad.l - pad.r;
+      const plotH = h - pad.t - pad.b;
       ctx.strokeStyle = "#2a2a2a";
       ctx.beginPath();
       for (let i = 0; i <= 4; i++) {
-        const y = pad.t + (h - pad.t - pad.b) * i / 4;
+        const y = pad.t + plotH * i / 4;
         ctx.moveTo(pad.l, y); ctx.lineTo(w - pad.r, y);
       }
       ctx.stroke();
-      ctx.strokeStyle = "#10b981";
-      ctx.lineWidth = 2;
-      ctx.beginPath();
-      values.forEach((item, i) => {
-        const x = values.length === 1 ? pad.l : pad.l + (w - pad.l - pad.r) * i / (values.length - 1);
-        const y = pad.t + (h - pad.t - pad.b) - ((Number(item.value) - min) / (max - min)) * (h - pad.t - pad.b);
-        if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+
+      ctx.fillStyle = "#64748b";
+      ctx.font = "12px Consolas, monospace";
+      ctx.textAlign = "right";
+      for (let i = 0; i <= 4; i++) {
+        const value = 100 - i * 25;
+        const y = pad.t + plotH * i / 4;
+        ctx.fillText(value + "%", pad.l - 10, y + 4);
+      }
+      ctx.textAlign = "left";
+
+      items.forEach(item => {
+        const values = (item.values || []).filter(point => Number.isFinite(Number(point.value)));
+        if (!values.length) return;
+        let min = Math.min(...values.map(point => Number(point.value)));
+        let max = Math.max(...values.map(point => Number(point.value)));
+        if (min === max) { min -= 1; max += 1; }
+        ctx.strokeStyle = item.color;
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        values.forEach((point, i) => {
+          const x = values.length === 1 ? pad.l : pad.l + plotW * i / (values.length - 1);
+          const y = pad.t + plotH - ((Number(point.value) - min) / (max - min)) * plotH;
+          if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+        });
+        ctx.stroke();
+        values.forEach((point, i) => {
+          if (values.length > 1 && i % Math.max(1, Math.floor(values.length / 12)) !== 0 && i !== values.length - 1) return;
+          const x = values.length === 1 ? pad.l : pad.l + plotW * i / (values.length - 1);
+          const y = pad.t + plotH - ((Number(point.value) - min) / (max - min)) * plotH;
+          ctx.fillStyle = item.color;
+          ctx.beginPath();
+          ctx.arc(x, y, 3, 0, Math.PI * 2);
+          ctx.fill();
+        });
       });
-      ctx.stroke();
-      ctx.fillStyle = "#94a3b8";
-      ctx.font = "13px Consolas, monospace";
-      ctx.fillText(`${series[code]?.name || code} ${series[code]?.unit || ""}`, pad.l, 18);
+
+      let lx = pad.l;
+      items.forEach(item => {
+        const label = `${item.name || item.code}${item.unit ? " " + item.unit : ""}`;
+        ctx.fillStyle = item.color;
+        ctx.fillRect(lx, 14, 20, 3);
+        ctx.fillStyle = "#94a3b8";
+        ctx.font = "12px Microsoft YaHei, sans-serif";
+        ctx.fillText(label, lx + 28, 18);
+        lx += Math.min(150, 42 + label.length * 12);
+      });
     }
     function emptyChart(ctx, w, h, text) {
       ctx.fillStyle = "#64748b";

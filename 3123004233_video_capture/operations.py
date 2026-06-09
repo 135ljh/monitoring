@@ -248,10 +248,13 @@ def _record_clip(capture, monitor_id, camera_id, sequence, segment_seconds):
         raise RuntimeError("cannot create video writer: %s" % video_path)
 
     frames = 0
+    last_live_frame_at = 0.0
     try:
         if first_frame is not None:
             writer.write(first_frame)
             cv2.imwrite(str(cover_path), first_frame)
+            if _publish_latest_frame(monitor_id, first_frame):
+                last_live_frame_at = time.time()
             frames += 1
 
         deadline = time.time() + segment_seconds
@@ -262,6 +265,9 @@ def _record_clip(capture, monitor_id, camera_id, sequence, segment_seconds):
             if frames == 0:
                 cv2.imwrite(str(cover_path), frame)
             writer.write(frame)
+            now = time.time()
+            if now - last_live_frame_at >= 0.15 and _publish_latest_frame(monitor_id, frame):
+                last_live_frame_at = now
             frames += 1
     finally:
         writer.release()
@@ -380,6 +386,28 @@ def _set_redis_status(monitor_id, status):
         functions.releaseRedisConn(conn)
     except Exception:
         pass
+
+
+def _publish_latest_frame(monitor_id, frame):
+    conn = None
+    try:
+        ok, encoded = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 78])
+        if not ok:
+            return False
+        import functions
+
+        conn = functions.getRedisConn()
+        conn.set("monitor:%s:latest_frame_jpeg" % monitor_id, encoded.tobytes(), ex=15)
+        conn.set("monitor:%s:latest_frame_ts" % monitor_id, _now_text(), ex=15)
+        return True
+    except Exception:
+        return False
+    finally:
+        if conn is not None:
+            try:
+                functions.releaseRedisConn(conn)
+            except Exception:
+                pass
 
 
 def _update_task(monitor_id, **kwargs):
