@@ -7,9 +7,10 @@ import threading
 from collections import Counter, deque
 
 import pymysql
+import requests
 import uvicorn
 from fastapi import FastAPI
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, Response
 from kafka import KafkaConsumer
 
 
@@ -132,6 +133,16 @@ def _build_app():
     def sensors(monitor_id: str = None, limit: int = 180):
         return {"msg": "success", "data": _sensor_snapshot(monitor_id, limit)}
 
+    @app.get("/api/proxy-image")
+    def proxy_image(url: str):
+        try:
+            resp = requests.get(url, timeout=8)
+            resp.raise_for_status()
+            media_type = resp.headers.get("content-type") or "image/jpeg"
+            return Response(content=resp.content, media_type=media_type)
+        except Exception as exc:
+            return Response(content=("image proxy failed: %s" % exc).encode("utf-8"), status_code=502)
+
     return app
 
 
@@ -220,8 +231,9 @@ def _mysql_conn():
     port = int(cfg.get("PORT", os.getenv("MYSQL_PORT", 3306)))
     user = cfg.get("USER", os.getenv("MYSQL_USER", "root"))
     password = cfg.get("PASSWORD", os.getenv("MYSQL_PASSWORD", "123456"))
-    database = cfg.get("DATABASE", os.getenv("MYSQL_DATABASE", "workshop_monitoring"))
+    database = cfg.get("DATABASE", os.getenv("MYSQL_DATABASE", "monitoring"))
     try:
+        _ensure_database(host, port, user, password, database)
         return pymysql.connect(
             host=host,
             port=port,
@@ -234,6 +246,41 @@ def _mysql_conn():
     except Exception as exc:
         print("mysql unavailable for visualization: %s" % exc)
         return None
+
+
+def _ensure_database(host, port, user, password, database):
+    conn = pymysql.connect(
+        host=host,
+        port=port,
+        user=user,
+        password=password,
+        charset="utf8mb4",
+        autocommit=True,
+    )
+    try:
+        with conn.cursor() as cur:
+            cur.execute("CREATE DATABASE IF NOT EXISTS `%s` DEFAULT CHARACTER SET utf8mb4" % database.replace("`", ""))
+            cur.execute("USE `%s`" % database.replace("`", ""))
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS sensor_data_record (
+                    id BIGINT PRIMARY KEY AUTO_INCREMENT,
+                    monitor_id VARCHAR(128),
+                    panel_no VARCHAR(32),
+                    sensor_code VARCHAR(128),
+                    sensor_name VARCHAR(128),
+                    address VARCHAR(32),
+                    raw_value DOUBLE,
+                    value DOUBLE,
+                    unit VARCHAR(32),
+                    status VARCHAR(32),
+                    collected_at DATETIME,
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    INDEX idx_sensor_collected_at (sensor_code, collected_at),
+                    INDEX idx_monitor_collected_at (monitor_id, collected_at)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            """)
+    finally:
+        conn.close()
 
 
 def _recent(items, monitor_id, limit):
@@ -495,7 +542,7 @@ HTML = r"""
         camera.innerHTML = '<div class="empty">等待识别画面</div>';
         return;
       }
-      camera.innerHTML = `<img id="cameraImg" src="${esc(cacheBust(frame))}" alt="实时摄像头画面">`;
+      camera.innerHTML = `<img id="cameraImg" src="${esc(cacheBust(proxyImage(frame)))}" alt="实时摄像头画面">`;
       const img = document.getElementById("cameraImg");
       img.addEventListener("load", () => drawRegions(camera, img, regions), { once: true });
       document.getElementById("clipInfo").textContent = live.event?.clip_id || live.recognition?.clip_id || "实时帧";
@@ -526,6 +573,9 @@ HTML = r"""
     }
     function cacheBust(url) {
       return `${url}${url.includes("?") ? "&" : "?"}t=${Date.now()}`;
+    }
+    function proxyImage(url) {
+      return `/api/proxy-image?url=${encodeURIComponent(url)}`;
     }
     function renderEvents(events) {
       document.getElementById("events").innerHTML = events.map(e => `

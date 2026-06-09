@@ -27,7 +27,7 @@ DEFAULT_RUNNING_SECONDS = 1.0
 DEFAULT_HELP_GESTURE_SECONDS = 1.0
 DEFAULT_FALL_NO_MOVEMENT_SECONDS = 6.0
 DEFAULT_CROWD_PERSON_THRESHOLD = 5
-DEFAULT_VIBRATION_DANGER_THRESHOLD = 0.006
+DEFAULT_VIBRATION_DANGER_THRESHOLD = 0.035
 DEFAULT_STATIC_CENTER_DELTA = 0.035
 DEFAULT_RUNNING_CENTER_DELTA = 0.12
 DEFAULT_SENSOR_POLL_INTERVAL = 2.0
@@ -501,6 +501,9 @@ def _judge_person_static(monitor_id, msg, person, person_id, abnormal_types, des
 
 def _judge_person_fall(monitor_id, msg, person, person_id, abnormal_types, descriptions):
     condition = "person:%s:fall" % person_id
+    if _config_bool("JUDGE", "REQUIRE_OPENPOSE_FOR_FALL", True) and person.get("keypoint_backend") != "openpose":
+        _delete_condition(monitor_id, condition)
+        return
     if not person.get("fall_suspected"):
         _delete_condition(monitor_id, condition)
         return
@@ -513,6 +516,9 @@ def _judge_person_fall(monitor_id, msg, person, person_id, abnormal_types, descr
 def _judge_abnormal_posture(monitor_id, msg, person, person_id, abnormal_types, descriptions):
     condition = "person:%s:abnormal_posture" % person_id
     if not _config_bool("JUDGE", "ENABLE_ABNORMAL_POSTURE_RULE", True):
+        _delete_condition(monitor_id, condition)
+        return
+    if _config_bool("JUDGE", "REQUIRE_OPENPOSE_FOR_POSTURE", True) and person.get("keypoint_backend") != "openpose":
         _delete_condition(monitor_id, condition)
         return
     posture_type = person.get("posture_type")
@@ -557,6 +563,9 @@ def _judge_help_gesture(monitor_id, msg, person, person_id, abnormal_types, desc
 
 def _judge_fall_no_movement(monitor_id, msg, person, person_id, abnormal_types, descriptions):
     condition = "person:%s:fall_no_movement" % person_id
+    if _config_bool("JUDGE", "REQUIRE_OPENPOSE_FOR_FALL", True) and person.get("keypoint_backend") != "openpose":
+        _delete_condition(monitor_id, condition)
+        return
     motion_threshold = float(_config_value("JUDGE", "FALL_NO_MOVEMENT_MOTION_THRESHOLD", 0.012))
     if not person.get("fall_suspected") or float(person.get("movement_score", 0.0) or 0.0) >= motion_threshold:
         _delete_condition(monitor_id, condition)
@@ -601,8 +610,11 @@ def _judge_device_vibration(monitor_id, msg, abnormal_types, descriptions):
         device_id = device.get("device_id", "unknown")
         vibration_score = float(device.get("vibration_score", 0.0) or 0.0)
         _push_history("monitor:%s:device:%s:vibration_history" % (monitor_id, device_id), vibration_score)
-        danger_threshold = float(_config_value("JUDGE", "VIBRATION_DANGER_THRESHOLD", DEFAULT_VIBRATION_DANGER_THRESHOLD))
-        if device.get("vibration_level") == "danger" or vibration_score >= danger_threshold:
+        danger_threshold = max(
+            DEFAULT_VIBRATION_DANGER_THRESHOLD,
+            float(_config_value("JUDGE", "VIBRATION_DANGER_THRESHOLD", DEFAULT_VIBRATION_DANGER_THRESHOLD)),
+        )
+        if vibration_score >= danger_threshold:
             abnormal_types.append("device_vibration")
             descriptions.append("\u8bbe\u5907%s\u5b58\u5728\u5f02\u5e38\u9707\u52a8\uff0c\u9707\u52a8\u5206\u6570%.4f" % (
                 device_id, vibration_score))

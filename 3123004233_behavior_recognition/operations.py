@@ -176,6 +176,7 @@ def _analyze_video(source_path, annotated_path, annotated_frame_path):
     sampled_person_boxes = []
     frame_index = 0
 
+    person_roi = _person_detection_roi(width, height)
     device_roi = _device_roi(width, height)
 
     try:
@@ -218,7 +219,7 @@ def _analyze_video(source_path, annotated_path, annotated_frame_path):
     vibration_level = _vibration_level(vibration_score)
 
     deduped_boxes = _dedupe_boxes(person_boxes)
-    yolo_boxes = _run_yolo_person_detector(source_path, width, height)
+    yolo_boxes = _run_yolo_person_detector(source_path, width, height, person_roi)
     if yolo_boxes:
         openpose_tracks = _run_openpose(source_path, width, height)
         if openpose_tracks:
@@ -227,7 +228,7 @@ def _analyze_video(source_path, annotated_path, annotated_frame_path):
         else:
             person_results = []
         if not person_results:
-            person_results = _yolo_person_results(yolo_boxes, width, height, movement_score, upper_motion_score, action_type)
+            person_results = _yolo_person_results(yolo_boxes, movement_score, upper_motion_score, action_type)
         person_count = len(person_results)
         pose_backend = "yolo_openpose" if any(item.get("keypoint_backend") == "openpose" for item in person_results) else "yolo"
     else:
@@ -326,7 +327,7 @@ def _clamp_xyxy(bbox, width, height):
     return x1, y1, x2, y2
 
 
-def _run_yolo_person_detector(source_path, width, height):
+def _run_yolo_person_detector(source_path, width, height, person_roi=None):
     if not _config_bool("YOLO", "ENABLED", True):
         return []
     model = _load_yolo_model()
@@ -356,7 +357,7 @@ def _run_yolo_person_detector(source_path, width, height):
                     confs = result.boxes.conf.cpu().numpy()
                     for box, conf in zip(xyxy, confs):
                         x1, y1, x2, y2 = [int(v) for v in box]
-                        if _valid_yolo_box([x1, y1, x2, y2], width, height):
+                        if _valid_yolo_box([x1, y1, x2, y2], width, height, person_roi):
                             boxes.append({"bbox": [x1, y1, x2, y2], "confidence": float(conf)})
                 sampled += 1
             frame_index += 1
@@ -397,12 +398,14 @@ def _resolve_model_path(value):
     return path
 
 
-def _valid_yolo_box(box, width, height):
+def _valid_yolo_box(box, width, height, person_roi=None):
     x1, y1, x2, y2 = box
     w = max(0, x2 - x1)
     h = max(0, y2 - y1)
     area_ratio = (w * h) / float(max(1, width * height))
     height_ratio = h / float(max(1, height))
+    if person_roi and not _center_in_roi(box, person_roi):
+        return False
     return (
         area_ratio >= float(_config_value("YOLO", "MIN_BBOX_AREA_RATIO", 0.03))
         and height_ratio >= float(_config_value("YOLO", "MIN_BBOX_HEIGHT_RATIO", 0.25))
@@ -435,23 +438,19 @@ def _filter_openpose_results_by_yolo(person_results, yolo_boxes, width, height):
     return filtered
 
 
-def _yolo_person_results(yolo_boxes, width, height, movement_score, upper_motion_score, action_type):
+def _yolo_person_results(yolo_boxes, movement_score, upper_motion_score, action_type):
     results = []
     for idx, item in enumerate(yolo_boxes):
-        x1, y1, x2, y2 = item["bbox"]
-        box = [x1, y1, max(1, x2 - x1), max(1, y2 - y1)]
-        posture_type, posture_score = _posture_from_box(box, width, height)
-        fall_suspected = _fall_suspected(box, width, height, posture_type, True)
-        help_suspected = _help_gesture_suspected(upper_motion_score, movement_score, posture_type)
+        help_suspected = _help_gesture_suspected(upper_motion_score, movement_score, "standing")
         results.append({
             "person_id": "P%03d" % (idx + 1),
             "bbox": item["bbox"],
             "action_type": action_type,
             "movement_score": movement_score,
             "center_speed": 0.0,
-            "posture_type": posture_type,
-            "posture_score": round(posture_score, 4),
-            "fall_suspected": fall_suspected,
+            "posture_type": "unknown",
+            "posture_score": 0.0,
+            "fall_suspected": False,
             "running_suspected": False,
             "help_gesture_suspected": help_suspected,
             "keypoint_backend": "none",
@@ -480,6 +479,14 @@ def _center_inside(inner, outer):
     cx = (x1 + x2) / 2.0
     cy = (y1 + y2) / 2.0
     return ox1 <= cx <= ox2 and oy1 <= cy <= oy2
+
+
+def _center_in_roi(box, roi):
+    x1, y1, x2, y2 = box
+    rx, ry, rw, rh = roi
+    cx = (x1 + x2) / 2.0
+    cy = (y1 + y2) / 2.0
+    return rx <= cx <= rx + rw and ry <= cy <= ry + rh
 
 
 def _fallback_person_results(deduped_boxes, sampled_person_boxes, width, height, movement_score, upper_motion_score, action_type):
@@ -970,13 +977,26 @@ def _device_roi(width, height):
         y = max(0, min(int(roi.get("y", 0)), height - 1))
         w = max(1, min(int(roi.get("w", width - x)), width - x))
         h = max(1, min(int(roi.get("h", height - y)), height - y))
+        if w * h < width * height * 0.85:
+            return x, y, w, h
+        print("configured DEVICE_ROI covers most of frame, using default device ROI")
+    return int(width * 0.62), int(height * 0.35), max(1, int(width * 0.25)), max(1, int(height * 0.35))
+
+
+def _person_detection_roi(width, height):
+    roi = _config_value("RECOGNITION", "PERSON_ROI", None)
+    if isinstance(roi, dict):
+        x = max(0, min(int(roi.get("x", 0)), width - 1))
+        y = max(0, min(int(roi.get("y", 0)), height - 1))
+        w = max(1, min(int(roi.get("w", width - x)), width - x))
+        h = max(1, min(int(roi.get("h", height - y)), height - y))
         return x, y, w, h
-    return int(width * 0.55), int(height * 0.25), max(1, int(width * 0.35)), max(1, int(height * 0.45))
+    return 0, int(height * 0.18), width, max(1, int(height * 0.82))
 
 
 def _vibration_level(score):
-    danger = float(_config_value("RECOGNITION", "VIBRATION_DANGER_THRESHOLD", 0.18))
-    warning = float(_config_value("RECOGNITION", "VIBRATION_WARNING_THRESHOLD", 0.08))
+    danger = max(0.035, float(_config_value("RECOGNITION", "VIBRATION_DANGER_THRESHOLD", 0.035)))
+    warning = max(0.02, float(_config_value("RECOGNITION", "VIBRATION_WARNING_THRESHOLD", 0.02)))
     if score >= danger:
         return "danger"
     if score >= warning:
