@@ -8,7 +8,7 @@
 
 - 接入工业 RTSP 摄像头或本地摄像头。
 - 将视频切片上传到 MinIO，并通过 Kafka 驱动后续处理链路。
-- 通过 YOLO 辅助人员检测，OpenPose 输出人体关键点，光流法检测设备 ROI 震动。
+- 通过 YOLO-Pose 优先输出人体框与关键点，YOLO/OpenPose 作为兼容兜底，光流法检测设备 ROI 震动。
 - 根据规则判断人员静止、跌倒、倒地无动作、弯腰/蹲下、离岗、聚集、奔跑、挥手求助、设备震动、传感器阈值异常。
 - 通过企业微信机器人发送报警文字、证据图片、证据视频。
 - 可选调用 PLC 蜂鸣器/声光报警和语音播报。
@@ -30,8 +30,9 @@ flowchart LR
     VP -->|workshop.processed_video| Kafka
 
     Kafka --> BR[行为识别组件<br/>3123004233_behavior_recognition]
-    BR --> YOLO[YOLO 人员检测]
-    BR --> OpenPose[OpenPose 姿态识别]
+    BR --> YoloPose[YOLO-Pose 人体框+关键点]
+    BR --> YOLO[YOLO 人员检测兜底]
+    BR --> OpenPose[OpenPose 姿态识别可选兜底]
     BR --> OpticalFlow[OpenCV 光流法]
     BR -->|识别结果| MinIO
     BR -->|workshop.recognition_result| Kafka
@@ -246,8 +247,8 @@ writer.write(denoised)
 职责：
 
 - 消费处理后视频。
-- 使用 YOLO 检测人员框，过滤非人体误检。
-- 可调用 OpenPose 生成 BODY_25 人体关键点。
+- 优先使用 YOLO-Pose 同时输出人员框和人体关键点。
+- YOLO 普通检测和 OpenPose 保留为兼容兜底。
 - 使用光流法计算设备 ROI 震动分数。
 - 生成人员行为结果、设备结果、场景统计结果。
 - 上传标注图片/视频。
@@ -255,13 +256,17 @@ writer.write(denoised)
 
 关键实现：
 
-1. YOLO 与 OpenPose 结合。
+1. YOLO-Pose 优先，YOLO 与 OpenPose 兜底。
 
 源码位置：`3123004233_behavior_recognition/operations.py:220`
 
 ```python
-yolo_boxes = _run_yolo_person_detector(source_path, width, height, person_roi)
-if yolo_boxes:
+yolo_pose_results = _run_yolo_pose_person_detector(source_path, width, height, person_roi)
+if yolo_pose_results:
+    person_results = yolo_pose_results
+    pose_backend = "yolo_pose"
+else:
+    yolo_boxes = _run_yolo_person_detector(source_path, width, height, person_roi)
     openpose_tracks = _run_openpose(source_path, width, height)
     if openpose_tracks:
         openpose_results = _openpose_person_results(openpose_tracks, width, height, movement_score, action_type)
@@ -272,13 +277,13 @@ if yolo_boxes:
 
 说明：
 
-- YOLO 作为人员检测“门控”，减少把海报、椅子、文字区域误识别成人的情况。
-- OpenPose 输出关键点后，再和 YOLO 人体框做关联。
-- OpenPose 失败时，系统退回 YOLO 结果，保证链路不中断。
+- YOLO-Pose 是当前主路径，直接输出人体框和 COCO17 关键点，再转换为系统内部 BODY25 兼容格式。
+- YOLO 普通检测作为人员门控兜底，减少把海报、椅子、文字区域误识别成人的情况。
+- OpenPose 保留为可选兜底，适合对比测试或报告说明，但不再作为优先路径。
 
 2. YOLO 人员检测。
 
-源码位置：`3123004233_behavior_recognition/operations.py:330`
+源码位置：`3123004233_behavior_recognition/operations.py:571`
 
 ```python
 results = model.predict(frame, imgsz=imgsz, conf=conf_threshold, classes=[0], verbose=False)
@@ -1250,38 +1255,98 @@ writer.write(denoised)
 
 - `recognition_result_topic`
 
-#### 8.3.2 YOLO 与 OpenPose 融合逻辑
+#### 8.3.2 YOLO-Pose 优先识别逻辑
 
 位置：`3123004233_behavior_recognition/operations.py:220`
 
 关键代码：
 
 ```python
-yolo_boxes = _run_yolo_person_detector(source_path, width, height, person_roi)
-if yolo_boxes:
-    openpose_tracks = _run_openpose(source_path, width, height)
-    if openpose_tracks:
-        openpose_results = _openpose_person_results(openpose_tracks, width, height, movement_score, action_type)
-        person_results = _filter_openpose_results_by_yolo(openpose_results, yolo_boxes, width, height)
-    else:
-        person_results = _yolo_person_results(yolo_boxes, movement_score, upper_motion_score, action_type)
+yolo_pose_results = _run_yolo_pose_person_detector(source_path, width, height, person_roi)
+if yolo_pose_results:
+    person_results = yolo_pose_results
+    person_count = len(person_results)
+    pose_backend = "yolo_pose"
 else:
-    if _config_bool("YOLO", "REQUIRE_PERSON_GATE", True):
-        person_results = []
-        person_count = 0
-        pose_backend = "yolo_no_person"
+    yolo_boxes = _run_yolo_person_detector(source_path, width, height, person_roi)
+    if yolo_boxes:
+        openpose_tracks = _run_openpose(source_path, width, height)
 ```
 
 说明：
 
-- YOLO 先判断“画面中是否确实有人”。
-- OpenPose 负责姿态关键点。
-- 如果 OpenPose 不可用，YOLO 结果仍可支持静止、人数、移动等基础判断。
+- YOLO-Pose 是当前优先路径，同时输出人体框和关键点。
+- YOLO-Pose 结果会转换为系统内部 BODY25 兼容格式，复用原有跌倒、弯腰、蹲下、挥手规则。
+- 如果 YOLO-Pose 不可用，再回退到普通 YOLO 检测和 OpenPose。
 - 如果 YOLO 没检测到人，并且 `REQUIRE_PERSON_GATE=true`，则不进入 OpenCV HOG 兜底，减少误报。
 
-#### 8.3.3 `_run_yolo_person_detector(source_path, width, height, person_roi=None)`
+#### 8.3.3 `_run_yolo_pose_person_detector(source_path, width, height, person_roi=None)`
 
-位置：`3123004233_behavior_recognition/operations.py:330`
+位置：`3123004233_behavior_recognition/operations.py:337`
+
+功能：
+
+- 使用 YOLO-Pose 从视频抽样帧中提取人体框和 COCO17 关键点。
+- 优先使用 Ultralytics `track` 模式进行人员轨迹关联。
+- 如果 tracking 依赖异常，则自动回退到 `predict`，避免整条识别链路无响应。
+
+关键代码：
+
+```python
+results = model.track(
+    frame,
+    imgsz=imgsz,
+    conf=conf_threshold,
+    classes=[0],
+    tracker=tracker,
+    persist=True,
+    verbose=False,
+)
+```
+
+兜底逻辑：
+
+```python
+except Exception as exc:
+    print("YOLO pose tracking failed, fallback to predict: %s" % exc)
+    results = model.predict(frame, imgsz=imgsz, conf=conf_threshold, classes=[0], verbose=False)
+```
+
+关键点转换：
+
+```python
+pose = _yolo_pose_to_body25(keypoints[idx])
+if pose is None or not _valid_pose_track_frame(pose, bbox, width, height, "YOLO_POSE"):
+    continue
+```
+
+说明：
+
+- 该函数是本次算法升级的核心。
+- 它比 OpenPose 外部进程调用更轻，更适合实时监控链路。
+- 当前模型文件为 `models/yolov8n-pose.pt`。
+
+#### 8.3.4 `_load_yolo_pose_model()`
+
+位置：`3123004233_behavior_recognition/operations.py:419`
+
+功能：
+
+- 单例加载 YOLO-Pose 模型。
+- 默认使用 `models/yolov8n-pose.pt`。
+
+关键代码：
+
+```python
+from ultralytics import YOLO
+
+model_path = _resolve_model_path(_config_value("YOLO_POSE", "MODEL_PATH", "models/yolov8n-pose.pt"))
+_YOLO_POSE_MODEL = YOLO(str(model_path))
+```
+
+#### 8.3.5 `_run_yolo_person_detector(source_path, width, height, person_roi=None)`
+
+位置：`3123004233_behavior_recognition/operations.py:571`
 
 功能：
 
@@ -1319,9 +1384,9 @@ if _valid_yolo_box([x1, y1, x2, y2], width, height, person_roi):
 return _dedupe_yolo_boxes(boxes, width, height)[:int(_config_value("YOLO", "MAX_PEOPLE", 6))]
 ```
 
-#### 8.3.4 `_load_yolo_model()`
+#### 8.3.6 `_load_yolo_model()`
 
-位置：`3123004233_behavior_recognition/operations.py:370`
+位置：`3123004233_behavior_recognition/operations.py:611`
 
 功能：
 
@@ -1342,9 +1407,9 @@ return _YOLO_MODEL
 - `_YOLO_LOCK` 保证多线程下只加载一次。
 - 默认模型 `yolov8n.pt` 体积小、速度快。
 
-#### 8.3.5 `_run_openpose(source_path, width, height)`
+#### 8.3.7 `_run_openpose(source_path, width, height)`
 
-位置：`3123004233_behavior_recognition/operations.py:523`
+位置：`3123004233_behavior_recognition/operations.py:764`
 
 功能：
 
@@ -1991,7 +2056,7 @@ const preferred = ["voltage", "temperature", "humidity", "noise", "current", "fr
 
 ### 9.1 算法准确率
 
-当前系统已接入 YOLO 和 OpenPose，但测试环境中存在海报、椅子、头部截断、人体不完整、摄像头角度变化等干扰。建议后续：
+当前系统已接入 YOLO-Pose、YOLO 和 OpenPose，但测试环境中存在海报、椅子、头部截断、人体不完整、摄像头角度变化等干扰。建议后续：
 
 - 设置人员检测 ROI，排除墙面海报和设备无关区域。
 - 使用更稳定的 YOLO 模型，例如 `yolov8s.pt` 或车间场景微调模型。

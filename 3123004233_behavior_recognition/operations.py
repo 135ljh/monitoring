@@ -41,6 +41,7 @@ BODY_25 = {
 _TASKS = {}
 _LOCK = threading.Lock()
 _YOLO_MODEL = None
+_YOLO_POSE_MODEL = None
 _YOLO_LOCK = threading.Lock()
 
 
@@ -219,28 +220,34 @@ def _analyze_video(source_path, annotated_path, annotated_frame_path):
     vibration_level = _vibration_level(vibration_score)
 
     deduped_boxes = _dedupe_boxes(person_boxes)
-    yolo_boxes = _run_yolo_person_detector(source_path, width, height, person_roi)
-    if yolo_boxes:
-        openpose_tracks = _run_openpose(source_path, width, height)
-        if openpose_tracks:
-            openpose_results = _openpose_person_results(openpose_tracks, width, height, movement_score, action_type)
-            person_results = _filter_openpose_results_by_yolo(openpose_results, yolo_boxes, width, height)
-        else:
-            person_results = []
-        if not person_results:
-            person_results = _yolo_person_results(yolo_boxes, movement_score, upper_motion_score, action_type)
+    yolo_pose_results = _run_yolo_pose_person_detector(source_path, width, height, person_roi)
+    if yolo_pose_results:
+        person_results = yolo_pose_results
         person_count = len(person_results)
-        pose_backend = "yolo_openpose" if any(item.get("keypoint_backend") == "openpose" for item in person_results) else "yolo"
+        pose_backend = "yolo_pose"
     else:
-        if _config_bool("YOLO", "REQUIRE_PERSON_GATE", True):
-            person_results = []
-            person_count = 0
-            pose_backend = "yolo_no_person"
-        else:
-            person_results = _fallback_person_results(
-                deduped_boxes, sampled_person_boxes, width, height, movement_score, upper_motion_score, action_type)
+        yolo_boxes = _run_yolo_person_detector(source_path, width, height, person_roi)
+        if yolo_boxes:
+            openpose_tracks = _run_openpose(source_path, width, height)
+            if openpose_tracks:
+                openpose_results = _openpose_person_results(openpose_tracks, width, height, movement_score, action_type)
+                person_results = _filter_openpose_results_by_yolo(openpose_results, yolo_boxes, width, height)
+            else:
+                person_results = []
+            if not person_results:
+                person_results = _yolo_person_results(yolo_boxes, movement_score, upper_motion_score, action_type)
             person_count = len(person_results)
-            pose_backend = "opencv_hog"
+            pose_backend = "yolo_openpose" if any(item.get("keypoint_backend") == "openpose" for item in person_results) else "yolo"
+        else:
+            if _config_bool("YOLO", "REQUIRE_PERSON_GATE", True):
+                person_results = []
+                person_count = 0
+                pose_backend = "yolo_no_person"
+            else:
+                person_results = _fallback_person_results(
+                    deduped_boxes, sampled_person_boxes, width, height, movement_score, upper_motion_score, action_type)
+                person_count = len(person_results)
+                pose_backend = "opencv_hog"
 
     device_results = [{
         "device_id": _config_value("RECOGNITION", "DEVICE_ID", "DEV_001"),
@@ -325,6 +332,240 @@ def _clamp_xyxy(bbox, width, height):
     x2 = max(0, min(width - 1, x2))
     y2 = max(0, min(height - 1, y2))
     return x1, y1, x2, y2
+
+
+def _run_yolo_pose_person_detector(source_path, width, height, person_roi=None):
+    if not _config_bool("YOLO_POSE", "ENABLED", True):
+        return []
+    model = _load_yolo_pose_model()
+    if model is None:
+        return []
+
+    cap = cv2.VideoCapture(str(source_path))
+    if not cap.isOpened():
+        return []
+
+    fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+    frame_step = max(1, int(float(_config_value("YOLO_POSE", "FRAME_INTERVAL_SECONDS", 0.4)) * fps))
+    max_frames = int(_config_value("YOLO_POSE", "MAX_FRAMES", 12))
+    conf_threshold = float(_config_value("YOLO_POSE", "CONFIDENCE", 0.45))
+    imgsz = int(_config_value("YOLO_POSE", "IMAGE_SIZE", 640))
+    tracker = str(_config_value("YOLO_POSE", "TRACKER", "bytetrack.yaml") or "bytetrack.yaml")
+    use_tracking = _config_bool("YOLO_POSE", "USE_TRACKING", True)
+
+    tracks = {}
+    fallback_track_id = 1
+    frame_index = 0
+    sampled = 0
+    try:
+        ok, frame = cap.read()
+        while ok and frame is not None and sampled < max_frames:
+            if frame_index % frame_step == 0:
+                try:
+                    if use_tracking:
+                        results = model.track(
+                            frame,
+                            imgsz=imgsz,
+                            conf=conf_threshold,
+                            classes=[0],
+                            tracker=tracker,
+                            persist=True,
+                            verbose=False,
+                        )
+                    else:
+                        results = model.predict(frame, imgsz=imgsz, conf=conf_threshold, classes=[0], verbose=False)
+                except Exception as exc:
+                    print("YOLO pose tracking failed, fallback to predict: %s" % exc)
+                    try:
+                        results = model.predict(frame, imgsz=imgsz, conf=conf_threshold, classes=[0], verbose=False)
+                    except Exception as predict_exc:
+                        print("YOLO pose inference failed: %s" % predict_exc)
+                        return []
+
+                for result in results or []:
+                    if result.boxes is None or result.keypoints is None:
+                        continue
+                    boxes = result.boxes.xyxy.cpu().numpy()
+                    confs = result.boxes.conf.cpu().numpy() if result.boxes.conf is not None else np.ones(len(boxes))
+                    ids = result.boxes.id.cpu().numpy().astype(int).tolist() if getattr(result.boxes, "id", None) is not None else []
+                    keypoints = result.keypoints.data.cpu().numpy()
+                    for idx, (box, conf) in enumerate(zip(boxes, confs)):
+                        x1, y1, x2, y2 = [int(v) for v in box]
+                        bbox = [x1, y1, x2, y2]
+                        if not _valid_yolo_box(bbox, width, height, person_roi):
+                            continue
+                        pose = _yolo_pose_to_body25(keypoints[idx])
+                        if pose is None or not _valid_pose_track_frame(pose, bbox, width, height, "YOLO_POSE"):
+                            continue
+                        if idx < len(ids):
+                            track_id = "T%03d" % ids[idx]
+                        else:
+                            track_id = _match_or_create_pose_track(tracks, bbox, fallback_track_id)
+                            if track_id == "T%03d" % fallback_track_id:
+                                fallback_track_id += 1
+                        entry = tracks.setdefault(track_id, {"frames": [], "boxes": [], "confidences": []})
+                        entry["frames"].append(pose)
+                        entry["boxes"].append(bbox)
+                        entry["confidences"].append(float(conf))
+                sampled += 1
+            frame_index += 1
+            ok, frame = cap.read()
+    finally:
+        cap.release()
+
+    return _yolo_pose_person_results(tracks, width, height)
+
+
+def _load_yolo_pose_model():
+    global _YOLO_POSE_MODEL
+    with _YOLO_LOCK:
+        if _YOLO_POSE_MODEL is not None:
+            return _YOLO_POSE_MODEL
+        try:
+            from ultralytics import YOLO
+
+            model_path = _resolve_model_path(_config_value("YOLO_POSE", "MODEL_PATH", "models/yolov8n-pose.pt"))
+            _YOLO_POSE_MODEL = YOLO(str(model_path))
+            return _YOLO_POSE_MODEL
+        except Exception as exc:
+            if _config_bool("YOLO_POSE", "REQUIRE_YOLO_POSE", False):
+                raise RuntimeError("YOLO pose unavailable: %s" % exc)
+            print("YOLO pose unavailable, fallback to detector/OpenPose: %s" % exc)
+            return None
+
+
+def _yolo_pose_person_results(tracks, width, height):
+    min_frames = int(_config_value("YOLO_POSE", "MIN_TRACK_FRAMES", 2))
+    max_people = int(_config_value("YOLO_POSE", "MAX_PEOPLE", _config_value("YOLO", "MAX_PEOPLE", 6)))
+    ranked = sorted(
+        tracks.items(),
+        key=lambda item: (len(item[1].get("frames", [])), np.mean(item[1].get("confidences", [0.0]))),
+        reverse=True,
+    )
+    results = []
+    for idx, (track_id, track) in enumerate(ranked[:max_people]):
+        frames = track.get("frames", [])
+        boxes = track.get("boxes", [])
+        if len(frames) < min_frames:
+            continue
+        latest = frames[-1]
+        bbox = _stable_bbox_from_track(boxes, latest, width, height)
+        center_speed = _keypoint_center_speed(frames, width, height)
+        posture_type, posture_score = _posture_from_keypoints(frames, width, height)
+        fall_suspected = _fall_from_keypoints(frames, width, height)
+        help_suspected = _help_from_keypoints(frames, height)
+        running_suspected = center_speed >= float(_config_value("RECOGNITION", "RUNNING_SPEED_THRESHOLD", 0.06))
+        movement_score = round(float(np.mean(_track_center_distances(frames, width, height))) if len(frames) >= 2 else 0.0, 4)
+        action_type = "static" if center_speed < float(_config_value("RECOGNITION", "STATIC_CENTER_SPEED_THRESHOLD", 0.008)) else "moving"
+        results.append({
+            "person_id": "P%03d" % (idx + 1),
+            "track_id": track_id,
+            "bbox": bbox,
+            "action_type": action_type,
+            "movement_score": movement_score,
+            "center_speed": round(center_speed, 4),
+            "posture_type": posture_type,
+            "posture_score": round(posture_score, 4),
+            "fall_suspected": fall_suspected,
+            "running_suspected": running_suspected,
+            "help_gesture_suspected": help_suspected,
+            "keypoint_format": "COCO17_BODY25_COMPAT",
+            "keypoint_backend": "yolo_pose",
+            "valid_keypoint_count": _valid_keypoint_count(latest),
+            "track_frame_count": len(frames),
+            "detector_backend": "yolo_pose",
+            "detector_confidence": round(float(np.mean(track.get("confidences", [0.0]))), 4),
+            "confidence": round(_mean_keypoint_confidence(latest), 4),
+        })
+    return results
+
+
+def _yolo_pose_to_body25(coco):
+    if coco is None or len(coco) < 17:
+        return None
+    body = np.zeros((25, 3), dtype=float)
+    mapping = {
+        0: 0,   # nose
+        6: 2,   # right shoulder
+        8: 3,   # right elbow
+        10: 4,  # right wrist
+        5: 5,   # left shoulder
+        7: 6,   # left elbow
+        9: 7,   # left wrist
+        12: 9,  # right hip
+        14: 10, # right knee
+        16: 11, # right ankle
+        11: 12, # left hip
+        13: 13, # left knee
+        15: 14, # left ankle
+    }
+    for src, dst in mapping.items():
+        body[dst] = coco[src]
+    left_shoulder = coco[5]
+    right_shoulder = coco[6]
+    if left_shoulder[2] > 0 and right_shoulder[2] > 0:
+        body[1] = [(left_shoulder[0] + right_shoulder[0]) / 2.0, (left_shoulder[1] + right_shoulder[1]) / 2.0, min(left_shoulder[2], right_shoulder[2])]
+    left_hip = coco[11]
+    right_hip = coco[12]
+    if left_hip[2] > 0 and right_hip[2] > 0:
+        body[8] = [(left_hip[0] + right_hip[0]) / 2.0, (left_hip[1] + right_hip[1]) / 2.0, min(left_hip[2], right_hip[2])]
+    return body
+
+
+def _valid_pose_track_frame(keypoints, bbox, width, height, section):
+    min_conf = float(_config_value(section, "MIN_PERSON_CONFIDENCE", 0.35))
+    min_points = int(_config_value(section, "MIN_VALID_KEYPOINTS", 7))
+    min_area = float(_config_value(section, "MIN_BBOX_AREA_RATIO", 0.025))
+    min_height = float(_config_value(section, "MIN_BBOX_HEIGHT_RATIO", 0.20))
+    x1, y1, x2, y2 = _clamp_xyxy(bbox, width, height)
+    area_ratio = max(0, x2 - x1) * max(0, y2 - y1) / float(max(1, width * height))
+    height_ratio = max(0, y2 - y1) / float(max(1, height))
+    return (
+        _mean_keypoint_confidence(keypoints) >= min_conf
+        and _valid_keypoint_count(keypoints) >= min_points
+        and area_ratio >= min_area
+        and height_ratio >= min_height
+        and _has_core_body_keypoints(keypoints)
+    )
+
+
+def _match_or_create_pose_track(tracks, bbox, next_id):
+    if not tracks:
+        return "T%03d" % next_id
+    best_id = None
+    best_iou = 0.0
+    for track_id, track in tracks.items():
+        boxes = track.get("boxes", [])
+        if not boxes:
+            continue
+        iou = _iou_xyxy(bbox, boxes[-1])
+        if iou > best_iou:
+            best_id = track_id
+            best_iou = iou
+    if best_id and best_iou >= float(_config_value("YOLO_POSE", "TRACK_IOU_THRESHOLD", 0.25)):
+        return best_id
+    return "T%03d" % next_id
+
+
+def _stable_bbox_from_track(boxes, latest, width, height):
+    if boxes:
+        recent = np.array(boxes[-3:], dtype=float)
+        return _clamp_xyxy(np.mean(recent, axis=0).tolist(), width, height)
+    return _keypoint_bbox(latest, width, height)
+
+
+def _track_center_distances(frames, width, height):
+    centers = []
+    for keypoints in frames:
+        center = _person_center_from_keypoints(keypoints)
+        if center is not None:
+            centers.append((center[0] / max(1, width), center[1] / max(1, height)))
+    distances = []
+    for idx in range(1, len(centers)):
+        dx = centers[idx][0] - centers[idx - 1][0]
+        dy = centers[idx][1] - centers[idx - 1][1]
+        distances.append(float(np.sqrt(dx * dx + dy * dy)))
+    return distances
 
 
 def _run_yolo_person_detector(source_path, width, height, person_roi=None):

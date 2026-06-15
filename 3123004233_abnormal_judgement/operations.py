@@ -501,7 +501,7 @@ def _judge_person_static(monitor_id, msg, person, person_id, abnormal_types, des
 
 def _judge_person_fall(monitor_id, msg, person, person_id, abnormal_types, descriptions):
     condition = "person:%s:fall" % person_id
-    if _config_bool("JUDGE", "REQUIRE_OPENPOSE_FOR_FALL", True) and person.get("keypoint_backend") != "openpose":
+    if not _pose_backend_allowed(person, "POSE_BACKENDS_FOR_FALL"):
         _delete_condition(monitor_id, condition)
         return
     if not person.get("fall_suspected"):
@@ -518,7 +518,7 @@ def _judge_abnormal_posture(monitor_id, msg, person, person_id, abnormal_types, 
     if not _config_bool("JUDGE", "ENABLE_ABNORMAL_POSTURE_RULE", True):
         _delete_condition(monitor_id, condition)
         return
-    if _config_bool("JUDGE", "REQUIRE_OPENPOSE_FOR_POSTURE", True) and person.get("keypoint_backend") != "openpose":
+    if not _pose_backend_allowed(person, "POSE_BACKENDS_FOR_POSTURE"):
         _delete_condition(monitor_id, condition)
         return
     posture_type = person.get("posture_type")
@@ -563,7 +563,7 @@ def _judge_help_gesture(monitor_id, msg, person, person_id, abnormal_types, desc
 
 def _judge_fall_no_movement(monitor_id, msg, person, person_id, abnormal_types, descriptions):
     condition = "person:%s:fall_no_movement" % person_id
-    if _config_bool("JUDGE", "REQUIRE_OPENPOSE_FOR_FALL", True) and person.get("keypoint_backend") != "openpose":
+    if not _pose_backend_allowed(person, "POSE_BACKENDS_FOR_FALL"):
         _delete_condition(monitor_id, condition)
         return
     motion_threshold = float(_config_value("JUDGE", "FALL_NO_MOVEMENT_MOTION_THRESHOLD", 0.012))
@@ -626,7 +626,7 @@ def _valid_person_for_judge(person):
     if confidence < min_confidence:
         return False
     valid_keypoints = int(person.get("valid_keypoint_count", 0) or 0)
-    if person.get("keypoint_backend") == "openpose" and valid_keypoints < int(_config_value("JUDGE", "MIN_VALID_KEYPOINTS", 5)):
+    if person.get("keypoint_backend") in ("openpose", "yolo_pose") and valid_keypoints < int(_config_value("JUDGE", "MIN_VALID_KEYPOINTS", 5)):
         return False
     bbox = person.get("bbox") or []
     if len(bbox) == 4:
@@ -637,6 +637,22 @@ def _valid_person_for_judge(person):
         if height < float(_config_value("JUDGE", "MIN_PERSON_BBOX_HEIGHT", 100)):
             return False
     return True
+
+
+def _pose_backend_allowed(person, config_key):
+    backend = str(person.get("keypoint_backend") or "")
+    allowed = _config_value("JUDGE", config_key, "openpose,yolo_pose")
+    if isinstance(allowed, str):
+        allowed_set = {item.strip() for item in allowed.split(",") if item.strip()}
+    elif isinstance(allowed, (list, tuple, set)):
+        allowed_set = {str(item).strip() for item in allowed if str(item).strip()}
+    else:
+        allowed_set = {"openpose", "yolo_pose"}
+    if backend in allowed_set:
+        return True
+    legacy_required = "FALL" in config_key and _config_bool("JUDGE", "REQUIRE_OPENPOSE_FOR_FALL", True)
+    legacy_required = legacy_required or ("POSTURE" in config_key and _config_bool("JUDGE", "REQUIRE_OPENPOSE_FOR_POSTURE", True))
+    return not legacy_required
 
 
 def _update_person_center_delta(monitor_id, person_id, person):

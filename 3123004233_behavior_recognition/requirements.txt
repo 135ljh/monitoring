@@ -8,3 +8,4 @@ minio==7.2.7
 opencv-python==4.13.0.92
 requests==2.32.3
 ultralytics==8.3.161
+lap==0.5.13
