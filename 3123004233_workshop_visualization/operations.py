@@ -3,6 +3,7 @@
 import datetime as dt
 import json
 import os
+import socket
 import threading
 import time
 from collections import Counter, deque
@@ -27,6 +28,8 @@ _RECOGNITIONS = deque(maxlen=200)
 _EVENTS = deque(maxlen=500)
 _ALARMS = deque(maxlen=500)
 _SERVER_STARTED = False
+_SERVER_HOST = None
+_SERVER_PORT = None
 
 
 def start_visualize(data):
@@ -42,12 +45,14 @@ def start_visualize(data):
         "KAFKA", "ALARM_RESULT_TOPIC", ALARM_RESULT_TOPIC)
     camera_source = (data or {}).get("url") or (data or {}).get("camera_url") or _config_value(
         "VISUALIZATION", "CAMERA_URL", os.getenv("VISUALIZATION_CAMERA_URL", "0"))
-    port = int(_config_value("VISUALIZATION", "PORT", os.getenv("VISUALIZATION_PORT", 8088)))
+    requested_port = int(_config_value("VISUALIZATION", "PORT", os.getenv("VISUALIZATION_PORT", 8088)))
     host = _config_value("VISUALIZATION", "HOST", os.getenv("VISUALIZATION_HOST", "127.0.0.1"))
     public_host = _config_value("VISUALIZATION", "PUBLIC_HOST", host)
-    dashboard_url = "http://%s:%s/workshop-dashboard?monitor_id=%s" % (public_host, port, monitor_id)
 
     with _LOCK:
+        _, actual_port = _ensure_server(host, requested_port)
+        dashboard_url = "http://%s:%s/workshop-dashboard?monitor_id=%s" % (public_host, actual_port, monitor_id)
+
         task = _TASKS.get(monitor_id)
         if task and task.get("status") == "running":
             return _response(monitor_id, dashboard_url, "running")
@@ -68,23 +73,39 @@ def start_visualize(data):
                          daemon=True, name="visual-events-%s" % monitor_id).start()
         threading.Thread(target=_consume_topic, args=(task, alarm_topic, _ALARMS, "alarm"),
                          daemon=True, name="visual-alarms-%s" % monitor_id).start()
-        _ensure_server(host, port)
 
     _set_status(monitor_id, "running")
     return _response(monitor_id, dashboard_url, "running")
 
 
 def _ensure_server(host, port):
-    global _SERVER_STARTED
+    global _SERVER_HOST, _SERVER_PORT, _SERVER_STARTED
     if _SERVER_STARTED:
-        return
+        return _SERVER_HOST, _SERVER_PORT
+    actual_port = _find_available_port(host, port)
     app = _build_app()
     threading.Thread(
-        target=lambda: uvicorn.run(app, host=host, port=port, log_level="warning"),
+        target=lambda: uvicorn.run(app, host=host, port=actual_port, log_level="warning"),
         daemon=True,
         name="workshop-dashboard-server",
     ).start()
+    _SERVER_HOST = host
+    _SERVER_PORT = actual_port
     _SERVER_STARTED = True
+    return _SERVER_HOST, _SERVER_PORT
+
+
+def _find_available_port(host, preferred_port):
+    max_tries = int(_config_value("VISUALIZATION", "PORT_SCAN_TRIES", 20))
+    for offset in range(max_tries):
+        port = int(preferred_port) + offset
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            try:
+                sock.bind((str(host), port))
+            except OSError:
+                continue
+            return port
+    raise RuntimeError("no available dashboard port from %s after %s tries" % (preferred_port, max_tries))
 
 
 def _build_app():
