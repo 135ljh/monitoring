@@ -586,7 +586,7 @@ def _valid_pose_track_frame(keypoints, bbox, width, height, section):
         and _valid_keypoint_count(keypoints) >= min_points
         and area_ratio >= min_area
         and height_ratio >= min_height
-        and _has_core_body_keypoints(keypoints)
+        and _has_pose_anchor_keypoints(keypoints)
     )
 
 
@@ -1070,6 +1070,18 @@ def _has_core_body_keypoints(keypoints):
     return True
 
 
+def _has_upper_body_keypoints(keypoints):
+    return (
+        _point(keypoints, "nose") is not None
+        and any(_point(keypoints, name) is not None for name in ("left_shoulder", "right_shoulder", "neck"))
+        and any(_point(keypoints, name) is not None for name in ("left_elbow", "right_elbow", "left_wrist", "right_wrist"))
+    )
+
+
+def _has_pose_anchor_keypoints(keypoints):
+    return _has_core_body_keypoints(keypoints) or _has_upper_body_keypoints(keypoints)
+
+
 def _keypoint_center_speed(frames, width, height):
     centers = []
     for keypoints in frames:
@@ -1088,7 +1100,7 @@ def _keypoint_center_speed(frames, width, height):
 
 def _person_center_from_keypoints(keypoints):
     points = []
-    for name in ("neck", "mid_hip", "left_hip", "right_hip"):
+    for name in ("neck", "mid_hip", "left_hip", "right_hip", "left_shoulder", "right_shoulder", "nose"):
         point = _point(keypoints, name)
         if point is not None:
             points.append(point)
