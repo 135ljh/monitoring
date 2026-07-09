@@ -396,10 +396,13 @@ def _run_yolo_pose_person_detector(source_path, width, height, person_roi=None):
     fallback_track_id = 1
     frame_index = 0
     sampled = 0
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+    sample_indices = _yolo_pose_sample_indices(total_frames, frame_step, max_frames)
     try:
         ok, frame = cap.read()
-        while ok and frame is not None and sampled < max_frames:
-            if frame_index % frame_step == 0:
+        while ok and frame is not None:
+            should_sample = frame_index in sample_indices if sample_indices is not None else frame_index % frame_step == 0
+            if should_sample:
                 try:
                     if use_tracking:
                         results = model.track(
@@ -447,12 +450,22 @@ def _run_yolo_pose_person_detector(source_path, width, height, person_roi=None):
                         entry["boxes"].append(bbox)
                         entry["confidences"].append(float(conf))
                 sampled += 1
+                if sampled >= max_frames:
+                    break
             frame_index += 1
             ok, frame = cap.read()
     finally:
         cap.release()
 
     return _yolo_pose_person_results(tracks, width, height)
+
+
+def _yolo_pose_sample_indices(total_frames, frame_step, max_frames):
+    if total_frames <= 0:
+        return None
+    if total_frames <= frame_step * max(1, max_frames):
+        return set(range(0, total_frames, max(1, frame_step)))
+    return set(int(round(value)) for value in np.linspace(0, total_frames - 1, max(1, max_frames)))
 
 
 def _load_yolo_pose_model():
@@ -491,9 +504,17 @@ def _yolo_pose_person_results(tracks, width, height):
         bbox = _stable_bbox_from_track(boxes, latest, width, height)
         center_speed = _keypoint_center_speed(frames, width, height)
         posture_type, posture_score = _posture_from_keypoints(frames, width, height)
-        fall_suspected = _fall_from_keypoints(frames, width, height)
-        help_suspected = _help_from_keypoints(frames, height)
-        running_suspected = center_speed >= float(_config_value("RECOGNITION", "RUNNING_SPEED_THRESHOLD", 0.06))
+        action_frame_count = len(frames)
+        min_action_frames = int(_config_value("YOLO_POSE", "MIN_ACTION_FRAMES", 3))
+        enough_action_frames = action_frame_count >= min_action_frames
+        fall_suspected = enough_action_frames and _fall_from_keypoints(frames, width, height)
+        help_suspected = enough_action_frames and not fall_suspected and _help_from_keypoints(frames, height)
+        running_suspected = (
+            enough_action_frames
+            and not fall_suspected
+            and posture_type == "standing"
+            and center_speed >= float(_config_value("RECOGNITION", "RUNNING_SPEED_THRESHOLD", 0.06))
+        )
         movement_score = round(float(np.mean(_track_center_distances(frames, width, height))) if len(frames) >= 2 else 0.0, 4)
         action_type = "static" if center_speed < float(_config_value("RECOGNITION", "STATIC_CENTER_SPEED_THRESHOLD", 0.008)) else "moving"
         results.append({
