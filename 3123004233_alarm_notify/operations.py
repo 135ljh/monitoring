@@ -171,6 +171,9 @@ def _call_voice_alarm(event):
 
 
 def _call_enterprise_notify(event):
+    if not _config_bool("ALARM", "ENABLE_NOTIFY", False):
+        return "not_configured:notify_disabled"
+
     url = _config_value("ALARM", "WEBHOOK_URL", os.getenv("ALARM_WEBHOOK_URL"))
     if not url:
         return "not_configured"

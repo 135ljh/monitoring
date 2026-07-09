@@ -37,6 +37,22 @@ BODY_25 = {
     "left_knee": 13,
     "left_ankle": 14,
 }
+BODY_25_SKELETON = [
+    ("nose", "neck"),
+    ("neck", "right_shoulder"),
+    ("right_shoulder", "right_elbow"),
+    ("right_elbow", "right_wrist"),
+    ("neck", "left_shoulder"),
+    ("left_shoulder", "left_elbow"),
+    ("left_elbow", "left_wrist"),
+    ("neck", "mid_hip"),
+    ("mid_hip", "right_hip"),
+    ("right_hip", "right_knee"),
+    ("right_knee", "right_ankle"),
+    ("mid_hip", "left_hip"),
+    ("left_hip", "left_knee"),
+    ("left_knee", "left_ankle"),
+]
 
 _TASKS = {}
 _LOCK = threading.Lock()
@@ -323,6 +339,29 @@ def _draw_final_person_boxes(frame, person_results):
         )
         cv2.rectangle(frame, (x1, y1), (x2, y2), (30, 220, 30), 2)
         cv2.putText(frame, label, (x1, max(18, y1 - 6)), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (30, 220, 30), 2)
+        _draw_person_skeleton(frame, item.get("keypoints") or [])
+
+
+def _draw_person_skeleton(frame, keypoints):
+    point_map = {
+        item.get("name"): item
+        for item in keypoints or []
+        if item.get("name") and float(item.get("confidence", 0.0) or 0.0) >= 0.05
+    }
+    for start, end in BODY_25_SKELETON:
+        a = point_map.get(start)
+        b = point_map.get(end)
+        if not a or not b:
+            continue
+        cv2.line(
+            frame,
+            (int(a["x"]), int(a["y"])),
+            (int(b["x"]), int(b["y"])),
+            (255, 210, 70),
+            2,
+        )
+    for point in point_map.values():
+        cv2.circle(frame, (int(point["x"]), int(point["y"])), 4, (80, 220, 255), -1)
 
 
 def _clamp_xyxy(bbox, width, height):
@@ -461,6 +500,7 @@ def _yolo_pose_person_results(tracks, width, height):
             "person_id": "P%03d" % (idx + 1),
             "track_id": track_id,
             "bbox": bbox,
+            "keypoints": _keypoints_payload(latest),
             "action_type": action_type,
             "movement_score": movement_score,
             "center_speed": round(center_speed, 4),
@@ -916,6 +956,7 @@ def _openpose_person_results(tracks, width, height, movement_score, action_type)
         results.append({
             "person_id": "P%03d" % (idx + 1),
             "bbox": bbox,
+            "keypoints": _keypoints_payload(latest),
             "action_type": action_type,
             "movement_score": movement_score,
             "center_speed": round(center_speed, 4),
@@ -974,6 +1015,28 @@ def _valid_keypoint_count(keypoints):
     return int(np.sum(keypoints[:, 2] > float(_config_value("OPENPOSE", "KEYPOINT_CONFIDENCE", 0.05))))
 
 
+def _keypoints_payload(keypoints):
+    payload = []
+    if keypoints is None:
+        return payload
+    min_conf = float(_config_value("OPENPOSE", "KEYPOINT_CONFIDENCE", 0.05))
+    index_to_name = {idx: name for name, idx in BODY_25.items()}
+    for idx, point in enumerate(keypoints):
+        name = index_to_name.get(idx)
+        if not name:
+            continue
+        x, y, conf = [float(value) for value in point[:3]]
+        if conf < min_conf:
+            continue
+        payload.append({
+            "name": name,
+            "x": round(x, 2),
+            "y": round(y, 2),
+            "confidence": round(conf, 4),
+        })
+    return payload
+
+
 def _has_core_body_keypoints(keypoints):
     core_groups = [
         ("neck",),
@@ -1015,40 +1078,70 @@ def _person_center_from_keypoints(keypoints):
 
 
 def _posture_from_keypoints(frames, width, height):
-    keypoints = frames[-1]
+    posture_votes = []
+    for keypoints in frames:
+        posture, score = _single_frame_posture_from_keypoints(keypoints, width, height)
+        if posture != "standing":
+            posture_votes.append((posture, score))
+    if not posture_votes:
+        return "standing", 0.0
+    min_ratio = float(_config_value("OPENPOSE", "POSTURE_MIN_FRAME_RATIO", 0.55))
+    for posture in ("horizontal", "squat", "bend"):
+        votes = [score for item, score in posture_votes if item == posture]
+        if len(votes) / max(1.0, float(len(frames))) >= min_ratio:
+            return posture, float(np.mean(votes))
+    return "standing", 0.0
+
+
+def _single_frame_posture_from_keypoints(keypoints, width, height):
     torso_angle = _torso_angle_from_horizontal(keypoints)
     knee_angle = _min_knee_angle(keypoints)
     shoulder_y = _avg_y(keypoints, ("left_shoulder", "right_shoulder", "neck"))
     hip_y = _avg_y(keypoints, ("left_hip", "right_hip", "mid_hip"))
-    if torso_angle is not None and torso_angle <= float(_config_value("OPENPOSE", "FALL_TORSO_ANGLE", 35)):
+    bbox = _keypoint_bbox(keypoints, width, height)
+    bbox_w = max(1.0, float(bbox[2] - bbox[0]))
+    bbox_h = max(1.0, float(bbox[3] - bbox[1]))
+    aspect = bbox_w / bbox_h
+    core_visible = _has_core_body_keypoints(keypoints)
+    if (
+        core_visible
+        and torso_angle is not None
+        and torso_angle <= float(_config_value("OPENPOSE", "FALL_TORSO_ANGLE", 35))
+        and aspect >= float(_config_value("RECOGNITION", "FALL_ASPECT_THRESHOLD", 1.35))
+    ):
         return "horizontal", 1.0 - torso_angle / 90.0
-    if knee_angle is not None and knee_angle <= float(_config_value("OPENPOSE", "SQUAT_KNEE_ANGLE", 95)):
+    if knee_angle is not None and knee_angle <= float(_config_value("OPENPOSE", "SQUAT_KNEE_ANGLE", 80)):
         return "squat", 1.0 - knee_angle / 180.0
-    if shoulder_y is not None and hip_y is not None and abs(shoulder_y - hip_y) <= height * float(_config_value("OPENPOSE", "BEND_SHOULDER_HIP_DELTA_RATIO", 0.18)):
-        return "bend", 1.0 - abs(shoulder_y - hip_y) / max(1.0, height)
-    if torso_angle is not None and torso_angle <= float(_config_value("OPENPOSE", "BEND_TORSO_ANGLE", 60)):
+    shoulder_hip_close = (
+        shoulder_y is not None
+        and hip_y is not None
+        and abs(shoulder_y - hip_y) <= height * float(_config_value("OPENPOSE", "BEND_SHOULDER_HIP_DELTA_RATIO", 0.16))
+    )
+    torso_bent = torso_angle is not None and torso_angle <= float(_config_value("OPENPOSE", "BEND_TORSO_ANGLE", 48))
+    if core_visible and torso_bent and (shoulder_hip_close or torso_angle <= 40):
         return "bend", 1.0 - torso_angle / 90.0
     return "standing", 0.0
 
 
 def _fall_from_keypoints(frames, width, height):
-    keypoints = frames[-1]
-    torso_angle = _torso_angle_from_horizontal(keypoints)
-    head = _point(keypoints, "nose") or _point(keypoints, "neck")
-    hip = _point(keypoints, "mid_hip")
-    bbox = _keypoint_bbox(keypoints, width, height)
-    bbox_w = max(1.0, float(bbox[2] - bbox[0]))
-    bbox_h = max(1.0, float(bbox[3] - bbox[1]))
-    aspect = bbox_w / bbox_h
-    bottom_ratio = float(bbox[3]) / max(1.0, float(height))
-    if torso_angle is None and aspect < float(_config_value("RECOGNITION", "FALL_ASPECT_THRESHOLD", 1.35)):
-        return False
-    head_low = head is not None and head[1] >= height * float(_config_value("OPENPOSE", "FALL_HEAD_LOW_RATIO", 0.45))
-    hip_low = hip is not None and hip[1] >= height * float(_config_value("OPENPOSE", "FALL_HIP_LOW_RATIO", 0.50))
-    torso_horizontal = torso_angle is not None and torso_angle <= float(_config_value("OPENPOSE", "FALL_TORSO_ANGLE", 35))
-    bbox_horizontal = aspect >= float(_config_value("RECOGNITION", "FALL_ASPECT_THRESHOLD", 1.35))
-    body_low = bottom_ratio >= float(_config_value("RECOGNITION", "FALL_BOTTOM_RATIO", 0.55))
-    return (torso_horizontal or bbox_horizontal) and body_low and (head_low or hip_low or bbox_horizontal)
+    fall_frames = 0
+    for keypoints in frames:
+        torso_angle = _torso_angle_from_horizontal(keypoints)
+        head = _point(keypoints, "nose") or _point(keypoints, "neck")
+        hip = _point(keypoints, "mid_hip")
+        bbox = _keypoint_bbox(keypoints, width, height)
+        bbox_w = max(1.0, float(bbox[2] - bbox[0]))
+        bbox_h = max(1.0, float(bbox[3] - bbox[1]))
+        aspect = bbox_w / bbox_h
+        bottom_ratio = float(bbox[3]) / max(1.0, float(height))
+        head_low = head is not None and head[1] >= height * float(_config_value("OPENPOSE", "FALL_HEAD_LOW_RATIO", 0.50))
+        hip_low = hip is not None and hip[1] >= height * float(_config_value("OPENPOSE", "FALL_HIP_LOW_RATIO", 0.55))
+        torso_horizontal = torso_angle is not None and torso_angle <= float(_config_value("OPENPOSE", "FALL_TORSO_ANGLE", 35))
+        bbox_horizontal = aspect >= float(_config_value("RECOGNITION", "FALL_ASPECT_THRESHOLD", 1.35))
+        body_low = bottom_ratio >= float(_config_value("RECOGNITION", "FALL_BOTTOM_RATIO", 0.58))
+        if torso_horizontal and bbox_horizontal and body_low and (head_low or hip_low):
+            fall_frames += 1
+    return fall_frames / max(1.0, float(len(frames))) >= float(_config_value("OPENPOSE", "FALL_MIN_FRAME_RATIO", 0.45))
 
 
 def _help_from_keypoints(frames, height):
@@ -1070,12 +1163,13 @@ def _help_from_keypoints(frames, height):
     if raised_frames < int(_config_value("OPENPOSE", "HELP_MIN_RAISED_FRAMES", 2)):
         return False
     raised_ratio = raised_frames / max(1.0, float(len(frames)))
-    if raised_ratio >= float(_config_value("OPENPOSE", "HELP_RAISED_FRAME_RATIO", 0.45)):
-        return True
     if len(wrist_y_values) < 2:
-        return True
+        return False
     amplitude = max(wrist_y_values) - min(wrist_y_values)
-    return amplitude >= height * float(_config_value("OPENPOSE", "HELP_WRIST_AMPLITUDE_RATIO", 0.08))
+    return (
+        raised_ratio >= float(_config_value("OPENPOSE", "HELP_RAISED_FRAME_RATIO", 0.30))
+        and amplitude >= height * float(_config_value("OPENPOSE", "HELP_WRIST_AMPLITUDE_RATIO", 0.06))
+    )
 
 
 def _torso_angle_from_horizontal(keypoints):

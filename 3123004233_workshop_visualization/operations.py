@@ -201,16 +201,16 @@ def _mjpeg_frames(source, monitor_id=None):
 
 
 def _latest_cached_frame(monitor_id):
-    if not monitor_id:
-        return None
     conn = None
     try:
         import functions
 
         conn = functions.getRedisConn()
-        payload = conn.get("monitor:%s:latest_frame_jpeg" % monitor_id)
-        if payload:
-            return bytes(payload)
+        if monitor_id:
+            payload = conn.get("monitor:%s:latest_frame_jpeg" % monitor_id)
+            if payload:
+                return bytes(payload)
+        return _latest_any_cached_frame(conn)
     except Exception:
         return None
     finally:
@@ -219,6 +219,27 @@ def _latest_cached_frame(monitor_id):
                 functions.releaseRedisConn(conn)
             except Exception:
                 pass
+    return None
+
+
+def _latest_any_cached_frame(conn):
+    latest_key = None
+    latest_ts = ""
+    try:
+        iterator = conn.scan_iter(match="monitor:*:latest_frame_ts", count=50)
+    except AttributeError:
+        iterator = conn.keys("monitor:*:latest_frame_ts")
+    for key in iterator:
+        key_text = key.decode("utf-8") if isinstance(key, bytes) else str(key)
+        ts = conn.get(key_text)
+        ts_text = ts.decode("utf-8") if isinstance(ts, bytes) else str(ts or "")
+        if ts_text >= latest_ts:
+            latest_ts = ts_text
+            latest_key = key_text.replace(":latest_frame_ts", ":latest_frame_jpeg")
+    if latest_key:
+        payload = conn.get(latest_key)
+        if payload:
+            return bytes(payload)
     return None
 
 
@@ -524,6 +545,11 @@ HTML = r"""
     .empty { color: var(--muted); display: grid; min-height: 100%; place-items: center; }
     .region { position: absolute; border: 3px solid var(--danger); box-shadow: 0 0 0 1px rgba(255,255,255,.25), 0 0 18px rgba(239,68,68,.55); pointer-events: none; }
     .region span { position: absolute; left: -3px; top: -28px; background: var(--danger); color: #fff; font-size: 12px; padding: 4px 8px; border-radius: 6px 6px 6px 0; white-space: nowrap; }
+    .person-box { position: absolute; border: 2px solid #22c55e; box-shadow: 0 0 18px rgba(34,197,94,.42); pointer-events: none; }
+    .person-box span { position: absolute; left: -2px; top: -25px; background: #16a34a; color: #fff; font-size: 12px; padding: 3px 7px; border-radius: 6px 6px 6px 0; white-space: nowrap; }
+    .pose-overlay { position: absolute; inset: 0; pointer-events: none; }
+    .pose-line { stroke: #fbbf24; stroke-width: 3; stroke-linecap: round; filter: drop-shadow(0 0 5px rgba(251,191,36,.7)); }
+    .pose-dot { fill: #22d3ee; stroke: #052f3a; stroke-width: 2; filter: drop-shadow(0 0 5px rgba(34,211,238,.75)); }
     .metrics { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-bottom: 16px; }
     .metric { min-height: 102px; padding: 16px; position: relative; }
     .metric strong { color: var(--heading); display: block; font: 700 28px Consolas, monospace; margin-top: 18px; }
@@ -650,8 +676,10 @@ HTML = r"""
     function latestRegions(live) {
       return live.event?.abnormal_regions || [];
     }
+    function latestPeople(live) {
+      return live.recognition?.person_results || [];
+    }
     function renderCamera(live) {
-      const regions = latestRegions(live);
       const camera = document.getElementById("camera");
       const effectiveMonitorId = monitorId || live.monitor_id || live.event?.monitor_id || live.recognition?.monitor_id || "";
       const streamUrl = effectiveMonitorId
@@ -659,18 +687,18 @@ HTML = r"""
         : "/api/camera-stream";
       if (camera.dataset.streamUrl !== streamUrl) {
         camera.dataset.streamUrl = streamUrl;
-        camera.innerHTML = `<img id="cameraImg" src="${esc(streamUrl)}" alt="实时摄像头画面">`;
+        camera.innerHTML = `<img id="cameraImg" src="${esc(streamUrl)}" alt="live camera">`;
         const img = document.getElementById("cameraImg");
-        img.addEventListener("load", () => drawRegions(camera, img, regions));
+        img.addEventListener("load", () => drawCameraOverlay(camera, img, live));
       }
       const img = document.getElementById("cameraImg");
       if (img && img.complete) {
-        drawRegions(camera, img, regions);
+        drawCameraOverlay(camera, img, live);
       }
-      document.getElementById("clipInfo").textContent = live.event?.clip_id || live.recognition?.clip_id || "实时视频流";
+      document.getElementById("clipInfo").textContent = live.event?.clip_id || live.recognition?.clip_id || "live stream";
     }
-    function drawRegions(container, img, regions) {
-      container.querySelectorAll(".region").forEach(item => item.remove());
+    function drawCameraOverlay(container, img, live) {
+      container.querySelectorAll(".region,.person-box,.pose-overlay").forEach(item => item.remove());
       const naturalW = img.naturalWidth || 1;
       const naturalH = img.naturalHeight || 1;
       const box = img.getBoundingClientRect();
@@ -680,18 +708,74 @@ HTML = r"""
       const displayH = naturalH * scale;
       const offsetX = (parent.width - displayW) / 2;
       const offsetY = (parent.height - displayH) / 2;
-      regions.forEach(region => {
+      const tx = value => offsetX + Number(value || 0) * scale;
+      const ty = value => offsetY + Number(value || 0) * scale;
+      const people = latestPeople(live);
+      people.forEach(person => {
+        const b = person.bbox || [];
+        if (b.length !== 4) return;
+        const el = document.createElement("div");
+        el.className = "person-box";
+        el.style.left = `${tx(b[0])}px`;
+        el.style.top = `${ty(b[1])}px`;
+        el.style.width = `${Math.max(2, (Number(b[2]) - Number(b[0])) * scale)}px`;
+        el.style.height = `${Math.max(2, (Number(b[3]) - Number(b[1])) * scale)}px`;
+        const backend = person.keypoint_backend || person.detector_backend || "pose";
+        el.innerHTML = `<span>${esc(person.person_id || "person")} ${esc(backend)}</span>`;
+        container.appendChild(el);
+      });
+      drawSkeletons(container, people, tx, ty, parent.width, parent.height);
+      latestRegions(live).forEach(region => {
         const b = region.bbox || [];
         if (b.length !== 4) return;
         const el = document.createElement("div");
         el.className = "region";
-        el.style.left = `${offsetX + b[0] * scale}px`;
-        el.style.top = `${offsetY + b[1] * scale}px`;
-        el.style.width = `${Math.max(2, (b[2] - b[0]) * scale)}px`;
-        el.style.height = `${Math.max(2, (b[3] - b[1]) * scale)}px`;
-        el.innerHTML = `<span>${esc(region.label || region.type || "异常")}</span>`;
+        el.style.left = `${tx(b[0])}px`;
+        el.style.top = `${ty(b[1])}px`;
+        el.style.width = `${Math.max(2, (Number(b[2]) - Number(b[0])) * scale)}px`;
+        el.style.height = `${Math.max(2, (Number(b[3]) - Number(b[1])) * scale)}px`;
+        el.innerHTML = `<span>${esc(region.label || region.type || "abnormal")}</span>`;
         container.appendChild(el);
       });
+    }
+    function drawSkeletons(container, people, tx, ty, width, height) {
+      const pairs = [
+        ["nose","neck"],
+        ["neck","right_shoulder"], ["right_shoulder","right_elbow"], ["right_elbow","right_wrist"],
+        ["neck","left_shoulder"], ["left_shoulder","left_elbow"], ["left_elbow","left_wrist"],
+        ["neck","mid_hip"],
+        ["mid_hip","right_hip"], ["right_hip","right_knee"], ["right_knee","right_ankle"],
+        ["mid_hip","left_hip"], ["left_hip","left_knee"], ["left_knee","left_ankle"],
+      ];
+      const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+      svg.setAttribute("class", "pose-overlay");
+      svg.setAttribute("viewBox", `0 0 ${Math.max(1, width)} ${Math.max(1, height)}`);
+      people.forEach(person => {
+        const points = new Map((person.keypoints || [])
+          .filter(point => Number(point.confidence || 0) >= 0.05)
+          .map(point => [point.name, point]));
+        pairs.forEach(([start, end]) => {
+          const a = points.get(start);
+          const b = points.get(end);
+          if (!a || !b) return;
+          const line = document.createElementNS("http://www.w3.org/2000/svg", "line");
+          line.setAttribute("class", "pose-line");
+          line.setAttribute("x1", tx(a.x));
+          line.setAttribute("y1", ty(a.y));
+          line.setAttribute("x2", tx(b.x));
+          line.setAttribute("y2", ty(b.y));
+          svg.appendChild(line);
+        });
+        points.forEach(point => {
+          const dot = document.createElementNS("http://www.w3.org/2000/svg", "circle");
+          dot.setAttribute("class", "pose-dot");
+          dot.setAttribute("cx", tx(point.x));
+          dot.setAttribute("cy", ty(point.y));
+          dot.setAttribute("r", 4);
+          svg.appendChild(dot);
+        });
+      });
+      container.appendChild(svg);
     }
     function renderEvents(events) {
       document.getElementById("events").innerHTML = events.map(e => `
